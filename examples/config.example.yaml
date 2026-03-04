@@ -1,0 +1,85 @@
+# ~/.recurse/config.yaml — Recurse configuration
+# Copy this to ~/.recurse/config.yaml and customize as needed.
+# All fields are optional — omit to use defaults.
+
+models:
+  # Root LLM: orchestrates decomposition via Python code.
+  # Default: qwen3.5:35b-a3b (only 3B active params, fast + smart)
+  root: qwen3.5:35b-a3b
+
+  # Sub LLM: handles focused chunk analysis.
+  # Default: qwen3.5:9b (beats 30B-class models on comprehension)
+  sub: qwen3.5:9b
+
+  # API endpoint (Ollama default)
+  base_url: http://localhost:11434/v1
+  api_key: ollama  # Ollama doesn't validate keys
+
+  # --- Alternative: Qwen API (DashScope) ---
+  # root: qwen3.5-plus
+  # sub: qwen3.5-flash
+  # base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  # api_key: ${DASHSCOPE_API_KEY}
+
+  # --- Alternative: OpenRouter ---
+  # root: qwen/qwen3.5-35b-a3b
+  # sub: qwen/qwen3.5-9b
+  # base_url: https://openrouter.ai/api/v1
+  # api_key: ${OPENROUTER_API_KEY}
+
+  # --- Alternative: vLLM (GPU-optimized local serving) ---
+  # base_url: http://localhost:8000/v1
+  # api_key: vllm
+
+  # --- Power mode: use 27B dense model as root ---
+  # root: qwen3.5:27b
+
+engine:
+  # Maximum number of RLM loop iterations before forcing a final answer
+  max_iterations: 15
+
+  # Truncate sandbox output beyond this many characters (prevents context explosion)
+  max_output_truncation: 50000
+
+  # Enable thinking mode (<think>...</think>) for root LLM
+  thinking_mode_root: true
+
+  # Disable thinking for sub-LLM (faster, cheaper)
+  thinking_mode_sub: false
+
+sandbox:
+  # Execution mode: "subprocess" (fast, default) or "docker" (isolated)
+  mode: subprocess
+
+  # Timeout per code block execution in seconds
+  timeout_seconds: 30
+
+storage:
+  # Where to store thread contexts, caches, and conversation history
+  path: ~/.recurse/threads
+
+  # Maximum total cache size (informational — not enforced yet)
+  max_cache_size_mb: 500
+
+ingest:
+  # Patterns to skip during directory ingestion
+  default_exclude:
+    - node_modules
+    - .git
+    - __pycache__
+    - .venv
+    - venv
+    - "*.pyc"
+    - "*.lock"
+    - dist
+    - build
+    - .mypy_cache
+    - .pytest_cache
+    - .ruff_cache
+    - "*.egg-info"
+
+  # Skip files larger than this (KB)
+  max_file_size_kb: 500
+
+  # Stop ingesting after this many files
+  max_total_files: 5000

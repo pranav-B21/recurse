@@ -1,0 +1,28 @@
+This is a sample long context for testing the Needle-In-A-Haystack (NIAH) capability.
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+Section 1: Introduction to Distributed Systems
+Distributed systems consist of multiple computers that communicate to achieve a common goal. Key challenges include network partitions, clock skew, and partial failures. The CAP theorem states that a distributed system can provide at most two of: Consistency, Availability, and Partition tolerance.
+
+Section 2: Consensus Algorithms
+Consensus algorithms allow distributed nodes to agree on a value. Raft separates leader election from log replication. Paxos achieves consensus in two phases: prepare and accept. Byzantine fault tolerance handles malicious nodes.
+
+Section 3: Data Storage Patterns
+Sharding divides data across multiple nodes. Replication maintains copies for fault tolerance. LSM trees optimize write performance. B-trees optimize read performance. Bloom filters reduce unnecessary disk reads.
+
+THE SECRET CODE IS: ALPHA-7749-ZETA
+
+Section 4: Network Protocols
+TCP provides reliable ordered delivery. UDP provides fast unreliable delivery. HTTP/2 multiplexes streams. gRPC builds on HTTP/2 for RPC. WebSockets provide bidirectional communication.
+
+Section 5: Caching Strategies
+Cache-aside reads from cache first. Write-through writes to cache and storage simultaneously. Write-behind batches writes asynchronously. Cache eviction policies include LRU, LFU, and FIFO.
+
+Section 6: Message Queues
+Kafka provides durable append-only log. RabbitMQ provides flexible routing. NATS is lightweight and fast. Message queues decouple producers from consumers and enable async processing.
+
+Section 7: Monitoring and Observability
+The three pillars are logs, metrics, and traces. Prometheus scrapes metrics. Grafana visualizes them. Jaeger traces distributed requests. Structured logging enables efficient querying.
+
+This document continues with many more sections to simulate a large context that exceeds typical LLM context windows. The RLM system should be able to locate the secret code above by writing Python code to search through this text rather than reading it all at once.
