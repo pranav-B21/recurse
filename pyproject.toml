@@ -18,6 +18,7 @@ docker = ["docker>=7.0.0"]
 
 [project.scripts]
 recurse = "recurse.server:main"
+recurse-upload = "recurse.hooks.upload_session:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["recurse"]

@@ -232,7 +232,9 @@ _CODE_BLOCK_RE = re.compile(r"```python\n([\s\S]*?)```", re.MULTILINE)
 
 def _extract_final(text: str) -> str | None:
     m = _FINAL_RE.search(text)
-    return m.group(1).strip() if m else None
+    if not m:
+        return None
+    return m.group(1).strip() or None
 
 
 def _extract_final_var(text: str) -> str | None:

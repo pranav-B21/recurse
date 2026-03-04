@@ -128,24 +128,14 @@ This preserves context window for reasoning, not file storage.
 
 What Recurse helps with:
 
-  ┌─────────────────┬─────────────────┬───────────────────────────────────┐
-  │    Scenario     │ Without Recurse │           With Recurse            │
-  ├─────────────────┼─────────────────┼───────────────────────────────────┤
-  │ "Explain auth   │ Claude reads    │ Claude calls recurse_query → Qwen │
-  │ in my 50k-line  │ files → burns   │  reads everything locally →       │
-  │ codebase"       │ your context    │ Claude only receives the answer   │
-  │                 │ fast            │ (~500 tokens)                     │
-  ├─────────────────┼─────────────────┼───────────────────────────────────┤
-  │ Your Claude     │ Fills up with   │ Stays clean                       │
-  │ Code context    │ file contents   │                                   │
-  ├─────────────────┼─────────────────┼───────────────────────────────────┤
-  │ Anthropic API   │ Large, used for │ Small (just the answer)           │
-  │ tokens          │  analysis       │                                   │
-  ├─────────────────┼─────────────────┼───────────────────────────────────┤
-  │ Local compute   │ None            │ Qwen models run on your machine   │
-  └─────────────────┴─────────────────┴───────────────────────────────────┘
+| Scenario | Without Recurse | With Recurse |
+|---|---|---|
+| "Explain auth in my 50k-line codebase" | Claude reads files → burns your context fast | Claude calls `recurse_query` → Qwen reads everything locally → Claude only receives the answer (~500 tokens) |
+| Your Claude Code context | Fills up with file contents | Stays clean |
+| Anthropic API tokens | Large, used for analysis | Small (just the answer) |
+| Local compute | None | Qwen models run on your machine |
 
-  
+
 
 ## License
 
