@@ -19,11 +19,11 @@ from recurse.engine.core import (
 
 
 def test_extract_final_simple():
-    assert _extract_final("FINAL(42)") == "42"
+    assert _extract_final("FINAL<<<42>>>") == "42"
 
 
 def test_extract_final_multiline():
-    text = "Some thinking...\nFINAL(The answer\nis 42)"
+    text = "Some thinking...\nFINAL<<<The answer\nis 42>>>"
     assert _extract_final(text) == "The answer\nis 42"
 
 
@@ -85,7 +85,7 @@ def run(coro):
 
 def test_engine_final_on_first_response(mock_engine):
     """Engine should return immediately when first response contains FINAL()."""
-    mock_engine.qwen.root_completion = AsyncMock(return_value="FINAL(The answer is 42)")
+    mock_engine.qwen.root_completion = AsyncMock(return_value="FINAL<<<The answer is 42>>>")
 
     result = run(mock_engine.query(
         query="What is the answer?",
@@ -103,7 +103,7 @@ def test_engine_code_then_final(mock_engine):
     """Engine executes code on iteration 1, gets FINAL() on iteration 2."""
     responses = [
         "I'll search for it.\n```python\nprint(CONTEXT[:100])\n```",
-        "FINAL(Found it: 42)",
+        "FINAL<<<Found it: 42>>>",
     ]
     mock_engine.qwen.root_completion = AsyncMock(side_effect=responses)
 
@@ -176,7 +176,7 @@ def test_engine_sub_call_via_llm_query(mock_engine):
 
     responses = [
         "```python\nresult = llm_query('sub question', 'some context')\nprint(result)\n```",
-        "FINAL(done)",
+        "FINAL<<<done>>>",
     ]
     mock_engine.qwen.root_completion = AsyncMock(side_effect=responses)
 
@@ -205,7 +205,7 @@ def test_engine_cache_hit(mock_engine):
     responses = [
         "```python\nr1 = llm_query('same q', 'same c')\nprint(r1)\n```",
         "```python\nr2 = llm_query('same q', 'same c')\nprint(r2)\n```",
-        "FINAL(done)",
+        "FINAL<<<done>>>",
     ]
     mock_engine.qwen.root_completion = AsyncMock(side_effect=responses)
 
@@ -222,7 +222,7 @@ def test_engine_cache_hit(mock_engine):
 
 def test_engine_status_tracking(mock_engine):
     """Status should reflect current state during execution."""
-    mock_engine.qwen.root_completion = AsyncMock(return_value="FINAL(done)")
+    mock_engine.qwen.root_completion = AsyncMock(return_value="FINAL<<<done>>>")
 
     run(mock_engine.query(
         query="Q",
@@ -238,7 +238,7 @@ def test_engine_no_code_block_nudge(mock_engine):
     """When root LLM returns no code, engine adds a nudge message."""
     responses = [
         "I'm thinking about this...",  # no code
-        "FINAL(42)",
+        "FINAL<<<42>>>",
     ]
     mock_engine.qwen.root_completion = AsyncMock(side_effect=responses)
 

@@ -96,28 +96,6 @@ Claude Code → stdio → recurse/server.py (MCP)
                      └── cache.py (sub-call caching)
 ```
 
-## Testing
-
-```bash
-# Unit tests (no Ollama required)
-pytest tests/ -v
-
-# Integration smoke test (needs Ollama)
-python -c "
-import asyncio
-from recurse.config import RecurseConfig
-from recurse.engine.core import RecurseEngine
-
-config = RecurseConfig()
-engine = RecurseEngine(config)
-result = asyncio.run(engine.query(
-    query='What is the secret number?',
-    context='... lots of text ... The secret number is 42 ... more text ...',
-    thread_id='test'
-))
-print(result.answer)
-assert '42' in result.answer
-"
 ```
 # Usage
 To make it permanent for all projects, add this to your ~/.claude/CLAUDE.md:

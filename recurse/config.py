@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, field_validator
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field, field_validator
+
+# Load .env from the repo root (two levels up from this file: recurse/config.py → recurse/ → repo root)
+_repo_root = Path(__file__).parent.parent
+load_dotenv(dotenv_path=_repo_root / ".env")
 
 
 def _expand_env(value: Any) -> Any:
@@ -27,10 +32,10 @@ def _expand_env(value: Any) -> Any:
 
 
 class ModelConfig(BaseModel):
-    root: str = "qwen3.5:35b-a3b"
-    sub: str = "qwen3.5:9b"
-    base_url: str = "http://localhost:11434/v1"
-    api_key: str = "ollama"
+    root: str = "llama-3.3-70b-versatile"
+    sub: str = "llama-3.1-8b-instant"
+    base_url: str = "https://api.groq.com/openai/v1"
+    api_key: str = Field(default_factory=lambda: os.environ.get("GROQ_API_KEY", ""))
 
 
 class EngineConfig(BaseModel):

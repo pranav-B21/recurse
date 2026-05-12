@@ -24,9 +24,9 @@ Rules:
 - NEVER print the entire CONTEXT. Always slice or filter first.
 - Use llm_query() for any reasoning over text. Don't try to reason about content yourself.
 - Use batch_llm_query() when you have multiple independent sub-questions.
-- When done, output FINAL(your answer here) or FINAL_VAR(variable_name) to return.
-- If you can't find the answer, say so in FINAL() — don't hallucinate.
+- When done, output FINAL<<<your full synthesized answer goes here>>> or FINAL_VAR(variable_name) to return.
+  Example: FINAL<<<The authentication system uses JWT tokens issued by auth/middleware.py and stored in Redis.>>>
+- If you can't find the answer, say so: FINAL<<<I could not find sufficient information to answer this query.>>> — don't hallucinate.
 """
 
-SUB_SYSTEM_PROMPT = """/no_think
-You are a precise analyst. Answer the question based only on the provided context. Be concise and direct."""
+SUB_SYSTEM_PROMPT = """You are a precise analyst. Answer the question based only on the provided context. Be concise and direct."""

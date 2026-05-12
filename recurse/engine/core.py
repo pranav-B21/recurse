@@ -18,7 +18,7 @@ from typing import Any
 
 from recurse.config import RecurseConfig
 from recurse.engine.prompts import ROOT_SYSTEM_PROMPT
-from recurse.engine.qwen import QwenClient
+from recurse.engine.llm_client import LLMClient
 from recurse.engine.sandbox import Sandbox
 from recurse.store.cache import ResultCache
 from recurse.store.context_store import ContextStore
@@ -48,7 +48,7 @@ class ThreadStatus:
 class RecurseEngine:
     def __init__(self, config: RecurseConfig) -> None:
         self.config = config
-        self.qwen = QwenClient(config.models)
+        self.qwen = LLMClient(config.models)
         self.sandbox = Sandbox(
             mode=config.sandbox.mode,
             timeout_seconds=config.sandbox.timeout_seconds,
@@ -169,6 +169,15 @@ class RecurseEngine:
                 # Capture partial findings if output looks informative
                 if output and output != "(no output)" and not output.startswith("Error:"):
                     status.partial_findings.append(output[:200])
+                elif output.startswith("Error: execution timed out"):
+                    conversation.append({
+                        "role": "user",
+                        "content": (
+                            "Your code timed out. Break it into smaller steps: "
+                            "first find file boundaries with a small regex, then process one file at a time. "
+                            "Never scan the full CONTEXT in a single pass."
+                        ),
+                    })
             else:
                 # No code block — model is thinking; nudge it forward
                 conversation.append({"role": "assistant", "content": response})
@@ -176,7 +185,7 @@ class RecurseEngine:
                     "role": "user",
                     "content": (
                         "Continue. Write Python code in a ```python block to analyze the context, "
-                        "or output FINAL(answer) when ready."
+                        "or output FINAL<<<your full synthesized answer>>> when ready."
                     ),
                 })
 
@@ -202,8 +211,10 @@ class RecurseEngine:
                 "role": "user",
                 "content": (
                     "You have reached the maximum number of iterations. "
-                    "Based on everything you have found so far, please output your best answer "
-                    "using FINAL(your answer here). Do not write more code."
+                    "Based on everything you have found so far, synthesize your best answer and output it as: "
+                    "FINAL<<<your full answer here>>>. "
+                    "Example: FINAL<<<The system works by doing X, Y, Z because...>>>. "
+                    "Do not write more code."
                 ),
             }
         ]
@@ -225,7 +236,7 @@ class RecurseEngine:
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-_FINAL_RE = re.compile(r"FINAL\(([\s\S]*?)\)", re.MULTILINE)
+_FINAL_RE = re.compile(r"FINAL<<<([\s\S]*?)>>>", re.MULTILINE)
 _FINAL_VAR_RE = re.compile(r"FINAL_VAR\((\w+)\)")
 _CODE_BLOCK_RE = re.compile(r"```python\n([\s\S]*?)```", re.MULTILINE)
 
