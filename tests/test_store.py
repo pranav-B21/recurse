@@ -1,172 +1,126 @@
-"""Tests for ContextStore and ResultCache."""
+"""Tests for recurse.store: ingestion, exclusions, persistence, turns."""
 
 import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
-from recurse.store.cache import ResultCache
-from recurse.store.context_store import ContextStore
+from recurse.store import ContextStore
 
-
-# ── ContextStore tests ─────────────────────────────────────────────────────
-
-
-@pytest.fixture
-def tmp_store(tmp_path):
-    return ContextStore(tmp_path)
+EXCLUDE = ["node_modules", ".git", "__pycache__", "*.lock", "*.pyc"]
 
 
 @pytest.fixture
-def sample_project(tmp_path):
-    """Create a tiny sample project for ingestion tests."""
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "main.py").write_text("print('hello')\n")
-    (project / "utils.py").write_text("def helper():\n    return 42\n")
-    src = project / "src"
-    src.mkdir()
-    (src / "core.py").write_text("# core module\nCONSTANT = 'test'\n")
-    # Should be excluded
-    (project / "__pycache__").mkdir()
-    (project / "__pycache__" / "main.cpython-311.pyc").write_bytes(b"\x00" * 10)
-    return project
-
-
-def test_ingest_directory(tmp_store, sample_project):
-    result = tmp_store.ingest_directory(
-        path=sample_project,
-        thread_id="test",
-        exclude_patterns=["__pycache__", "*.pyc"],
-    )
-    assert result.files_ingested == 3  # main.py, utils.py, src/core.py
-    assert result.total_size_bytes > 0
-    assert result.thread_id == "test"
-    assert "main.py" in result.file_tree or "main.py" in result.file_tree
-
-
-def test_load_context_format(tmp_store, sample_project):
-    tmp_store.ingest_directory(
-        path=sample_project,
-        thread_id="test",
-        exclude_patterns=["__pycache__", "*.pyc"],
-    )
-    context = tmp_store.load_context("test")
-    assert "=== FILE:" in context
-    assert "print('hello')" in context
-    assert "helper" in context
-
-
-def test_get_file(tmp_store, sample_project):
-    tmp_store.ingest_directory(
-        path=sample_project,
-        thread_id="test",
-        exclude_patterns=["__pycache__", "*.pyc"],
-    )
-    content = tmp_store.get_file("test", "main.py")
-    assert content is not None
-    assert "print('hello')" in content
-
-
-def test_get_file_not_found(tmp_store):
-    result = tmp_store.get_file("nonexistent", "foo.py")
-    assert result is None
-
-
-def test_get_manifest(tmp_store, sample_project):
-    tmp_store.ingest_directory(
-        path=sample_project,
-        thread_id="test",
-        exclude_patterns=["__pycache__", "*.pyc"],
-    )
-    manifest = tmp_store.get_manifest("test")
-    assert "files" in manifest
-    assert len(manifest["files"]) == 3
-    paths = [f["path"] for f in manifest["files"]]
-    assert any("main.py" in p for p in paths)
-
-
-def test_save_and_load_conversation(tmp_store):
-    tmp_store.save_conversation(
-        thread_id="test",
-        query="What is 2+2?",
-        answer="4",
-        metadata={"iterations_used": 1},
-    )
-    convos_dir = tmp_store._convos_dir("test")
-    files = list(convos_dir.glob("*.json"))
-    assert len(files) == 1
-    data = json.loads(files[0].read_text())
-    assert data["query"] == "What is 2+2?"
-    assert data["answer"] == "4"
-
-
-def test_list_threads(tmp_store, sample_project):
-    tmp_store.ingest_directory(sample_project, "thread1", exclude_patterns=["__pycache__", "*.pyc"])
-    tmp_store.ingest_directory(sample_project, "thread2", exclude_patterns=["__pycache__", "*.pyc"])
-    threads = tmp_store.list_threads()
-    thread_ids = [t["thread_id"] for t in threads]
-    assert "thread1" in thread_ids
-    assert "thread2" in thread_ids
-
-
-def test_delete_thread(tmp_store, sample_project):
-    tmp_store.ingest_directory(sample_project, "to_delete", exclude_patterns=["__pycache__", "*.pyc"])
-    assert tmp_store.delete_thread("to_delete") is True
-    assert tmp_store.get_manifest("to_delete") == {}
-
-
-def test_encode_decode_path():
-    assert ContextStore._encode_path("src/main.py") == "src__main.py"
-    assert ContextStore._encode_path("a/b/c.py") == "a__b__c.py"
-
-
-def test_max_file_size_respected(tmp_path):
-    store = ContextStore(tmp_path / "store")
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "small.py").write_text("x = 1")
-    (project / "big.py").write_text("x" * 600 * 1024)  # 600KB
-    result = store.ingest_directory(
-        path=project,
-        thread_id="test",
-        max_file_size_kb=500,
-    )
-    assert result.files_ingested == 1  # only small.py
-
-
-# ── ResultCache tests ──────────────────────────────────────────────────────
+def sample_dir(tmp_path):
+    src = tmp_path / "project"
+    (src / "sub").mkdir(parents=True)
+    (src / "node_modules").mkdir()
+    (src / "a.py").write_text("def hello():\n    return 'world'\n")
+    (src / "sub" / "b.md").write_text("# Notes\nthe needle is NEEDLE-42\n")
+    (src / "binary.bin").write_bytes(b"\xff\xfe\x00\x01binary")
+    (src / "big.txt").write_text("x" * 2048)
+    (src / "node_modules" / "dep.js").write_text("module.exports = 1")
+    (src / "poetry.lock").write_text("[[package]]")
+    return src
 
 
 @pytest.fixture
-def tmp_cache(tmp_path):
-    return ResultCache(tmp_path)
+def store(tmp_path):
+    return ContextStore(tmp_path / "threads")
 
 
-def test_cache_key_deterministic():
-    key1 = ResultCache.key("query", "context")
-    key2 = ResultCache.key("query", "context")
-    assert key1 == key2
+def _ingest(store, sample_dir, **overrides):
+    kwargs = dict(
+        exclude=EXCLUDE, max_file_size_kb=1, max_total_files=100, thread_id="t1"
+    )
+    kwargs.update(overrides)
+    return store.ingest_directory(sample_dir, **kwargs)
 
 
-def test_cache_key_different_inputs():
-    key1 = ResultCache.key("query1", "context")
-    key2 = ResultCache.key("query2", "context")
-    assert key1 != key2
+def test_ingest_includes_text_files_with_headers(store, sample_dir):
+    res = _ingest(store, sample_dir)
+    ctx = store.load_context("t1")
+    assert "=== FILE: a.py ===" in ctx
+    assert "=== FILE: sub/b.md ===" in ctx
+    assert "NEEDLE-42" in ctx
+    assert res.files_count == 2
+    assert res.token_estimate == len(ctx) // 4
+    assert "a.py" in res.file_tree and "sub/" in res.file_tree
 
 
-def test_cache_get_set(tmp_cache):
-    key = ResultCache.key("test query", "test context")
-    assert tmp_cache.get(key) is None  # miss
+def test_ingest_skips_binary_oversized_and_excluded(store, sample_dir):
+    res = _ingest(store, sample_dir)
+    ctx = store.load_context("t1")
+    assert "binary.bin" not in ctx
+    assert "big.txt" not in ctx  # > 1 KB limit
+    assert "node_modules" not in ctx
+    assert "poetry.lock" not in ctx
+    assert res.skipped_count == 2  # binary + oversized (excluded aren't counted)
 
-    tmp_cache.set(key, "cached answer")
-    assert tmp_cache.get(key) == "cached answer"  # hit
+
+def test_ingest_respects_max_total_files(store, sample_dir):
+    res = _ingest(store, sample_dir, max_total_files=1)
+    assert res.files_count == 1
 
 
-def test_cache_clear(tmp_cache):
-    key = ResultCache.key("q", "c")
-    tmp_cache.set(key, "value")
-    count = tmp_cache.clear()
-    assert count == 1
-    assert tmp_cache.get(key) is None
+def test_ingest_writes_manifest_with_hashes(store, sample_dir):
+    _ingest(store, sample_dir)
+    manifest = json.loads(
+        (store.base_path / "t1" / "manifest.json").read_text()
+    )
+    paths = {f["path"] for f in manifest["files"]}
+    assert paths == {"a.py", "sub/b.md"}
+    assert all(len(f["sha256"]) == 64 for f in manifest["files"])
+
+
+def test_ingest_empty_dir_raises(store, tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="No ingestible"):
+        store.ingest_directory(
+            empty, "t1", exclude=EXCLUDE, max_file_size_kb=500, max_total_files=10
+        )
+
+
+def test_ingest_missing_dir_raises(store, tmp_path):
+    with pytest.raises(NotADirectoryError):
+        store.ingest_directory(
+            tmp_path / "nope", "t1", exclude=[], max_file_size_kb=500, max_total_files=10
+        )
+
+
+def test_append_turn_and_history(store, sample_dir):
+    _ingest(store, sample_dir)
+    store.append_turn("t1", "q1?", "a1", {"provider": "groq"})
+    store.append_turn("t1", "q2?", "a2", {"provider": "groq"})
+
+    ctx = store.load_context("t1")
+    assert ctx.count("=== CONVERSATION TURN") == 2
+    assert "Q: q2?" in ctx and "A: a2" in ctx
+
+    turns = store.get_turns("t1")
+    assert [t["query"] for t in turns] == ["q1?", "q2?"]
+    assert store.get_turns("t1", limit=1)[0]["query"] == "q2?"
+    assert store.get_turns("nope") == []
+
+
+def test_thread_management(store, sample_dir):
+    assert store.list_threads() == []
+    assert not store.has_thread("t1")
+    _ingest(store, sample_dir)
+    store.append_turn("t1", "q", "a", {})
+
+    assert store.has_thread("t1")
+    threads = store.list_threads()
+    assert len(threads) == 1
+    assert threads[0]["thread_id"] == "t1"
+    assert threads[0]["turns"] == 1
+
+    store.delete_thread("t1")
+    assert not store.has_thread("t1")
+    with pytest.raises(FileNotFoundError):
+        store.delete_thread("t1")
+
+
+def test_load_context_missing_thread_raises(store):
+    with pytest.raises(FileNotFoundError, match="nope"):
+        store.load_context("nope")

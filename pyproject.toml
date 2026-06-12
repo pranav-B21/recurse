@@ -1,28 +1,26 @@
 [project]
 name = "recurse-rlm"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
-description = "RLM-powered unlimited context MCP server using Qwen 3.5 via Ollama"
+description = "Unlimited-context reasoning for coding agents — CLI + MCP server built on Recursive Language Models"
 
+# NOTE: the RLM library is intentionally NOT listed here — it is a modified
+# fork vendored at vendor/rlm. Listing `rlms` would pull the unmodified PyPI
+# package and shadow the fork. Two-step dev install (see README):
+#   pip install -e vendor/rlm && pip install -e .
 dependencies = [
-    "openai>=1.14.0",
     "mcp>=1.0.0",
-    "pydantic>=2.0.0",
     "pyyaml>=6.0",
     "rich>=13.0.0",
-    "python-dotenv>=1.0.0",
 ]
 
-[project.optional-dependencies]
-docker = ["docker>=7.0.0"]
-
 [project.scripts]
-recurse = "recurse.server:main"
-recurse-upload = "recurse.hooks.upload_session:main"
+recurse = "recurse.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["recurse"]
+exclude = ["recurse/.venv"]
 
 [build-system]
 requires = ["hatchling"]

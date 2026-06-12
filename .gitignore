@@ -1,2 +1,14 @@
 .recurse-thread
 .env
+.claude/settings.local.json
+.venv/
+recurse/.venv/
+__pycache__/
+logs/
+*.jsonl
+*.pyc
+.DS_Store
+.pytest_cache/
+*.egg-info/
+dist/
+build/

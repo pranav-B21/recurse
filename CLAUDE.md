@@ -1,3 +1,11 @@
+## Project: Recurse
+
+Read design.md in full before any task. The RLM library is vendored at
+vendor/rlm (editable-installed, modifiable — mods are tagged RECURSE-MOD and
+catalogued in vendor/rlm/RECURSE-MODS.md). Never `pip install rlms` from PyPI —
+it shadows the fork. The venv lives at recurse/.venv (inside the inner package
+folder); use its python explicitly when in doubt.
+
 ## Workflow Orchestration
 
 ### 1. Plan Mode Default

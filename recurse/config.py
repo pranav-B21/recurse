@@ -1,115 +1,142 @@
-"""Configuration loading for Recurse.
+"""Configuration for Recurse: provider presets, user config file, overrides.
 
-Loads from ~/.recurse/config.yaml if present, otherwise uses defaults.
-Supports ${ENV_VAR} expansion in string fields.
+Provider is a config choice, not a code path — the engine constructs RLM
+backend kwargs entirely from the resolved preset. API keys come from env vars
+only and are never stored in the config file.
 """
 
 from __future__ import annotations
 
 import os
-import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import yaml
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
 
-# Load .env from the repo root (two levels up from this file: recurse/config.py → recurse/ → repo root)
-_repo_root = Path(__file__).parent.parent
-load_dotenv(dotenv_path=_repo_root / ".env")
+PRESETS: dict[str, dict] = {
+    "groq": {
+        "backend": "openai",
+        "base_url": "https://api.groq.com/openai/v1",
+        "root_model": "llama-3.3-70b-versatile",
+        "sub_model": "llama-3.1-8b-instant",
+        "api_key_env": "GROQ_API_KEY",
+        "tpm_limit": 12000,  # free tier — engine guardrail uses this
+        "max_output_chars": 4000,
+    },
+    "openai": {
+        "backend": "openai",
+        "base_url": None,
+        "root_model": "gpt-5-mini",
+        "sub_model": "gpt-5-nano",
+        "api_key_env": "OPENAI_API_KEY",
+        "tpm_limit": None,
+        "max_output_chars": 20000,
+    },
+    "anthropic": {
+        "backend": "anthropic",
+        "base_url": None,
+        "root_model": "claude-sonnet-4-6",
+        "sub_model": "claude-haiku-4-5",
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "tpm_limit": None,
+        "max_output_chars": 20000,
+    },
+}
+
+DEFAULT_CONFIG_PATH = Path.home() / ".recurse" / "config.yaml"
+
+CONFIG_TEMPLATE = """\
+# Recurse configuration. API keys are read from env vars only
+# (GROQ_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY) — never stored here.
+
+provider: groq              # groq (free, small contexts) | openai (recommended) | anthropic
+# root_model: gpt-5-mini    # optional per-model overrides
+# sub_model: same           # "same" forces single-model mode if other_backends misbehaves
+
+max_iterations: 20
+environment: local          # local | docker
+verbose: true
+
+storage_path: ~/.recurse/threads
+
+ingest:
+  exclude: [node_modules, .git, __pycache__, .venv, dist, build, vendor, "*.lock", "*.pyc"]
+  max_file_size_kb: 500
+  max_total_files: 5000
+"""
 
 
-def _expand_env(value: Any) -> Any:
-    """Recursively expand ${VAR} placeholders in strings."""
-    if isinstance(value, str):
-        return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), m.group(0)), value)
-    if isinstance(value, dict):
-        return {k: _expand_env(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_expand_env(v) for v in value]
-    return value
-
-
-class ModelConfig(BaseModel):
-    root: str = "llama-3.3-70b-versatile"
-    sub: str = "llama-3.1-8b-instant"
-    base_url: str = "https://api.groq.com/openai/v1"
-    api_key: str = Field(default_factory=lambda: os.environ.get("GROQ_API_KEY", ""))
-
-
-class EngineConfig(BaseModel):
-    max_iterations: int = 15
-    max_output_truncation: int = 50000
-    thinking_mode_root: bool = True
-    thinking_mode_sub: bool = False
-
-
-class SandboxConfig(BaseModel):
-    mode: str = "subprocess"  # subprocess | docker
-    timeout_seconds: int = 30
-
-    @field_validator("mode")
-    @classmethod
-    def validate_mode(cls, v: str) -> str:
-        if v not in ("subprocess", "docker"):
-            raise ValueError(f"sandbox.mode must be 'subprocess' or 'docker', got '{v}'")
-        return v
-
-
-class StorageConfig(BaseModel):
-    path: str = "~/.recurse/threads"
-    max_cache_size_mb: int = 500
-
-
-class IngestConfig(BaseModel):
-    default_exclude: list[str] = [
-        "node_modules",
-        ".git",
-        "__pycache__",
-        ".venv",
-        "venv",
-        "*.pyc",
-        "*.lock",
-        "dist",
-        "build",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        "*.egg-info",
-    ]
+@dataclass
+class RecurseConfig:
+    provider: str = "groq"  # current default; switch to "openai" once credits loaded
+    root_model: str | None = None  # override preset
+    sub_model: str | None = None  # override preset; "same" forces single-model mode
+    max_iterations: int = 20
+    environment: str = "local"  # local | docker
+    verbose: bool = True
+    storage_path: Path = field(default_factory=lambda: Path.home() / ".recurse" / "threads")
+    ingest_exclude: list[str] = field(
+        default_factory=lambda: [
+            "node_modules", ".git", "__pycache__", ".venv", "dist", "build",
+            "*.lock", "*.pyc", ".DS_Store", "vendor",
+        ]
+    )
     max_file_size_kb: int = 500
     max_total_files: int = 5000
 
+    def resolved(self) -> dict:
+        """Preset merged with overrides + API key from env.
 
-class RecurseConfig(BaseModel):
-    models: ModelConfig = ModelConfig()
-    engine: EngineConfig = EngineConfig()
-    sandbox: SandboxConfig = SandboxConfig()
-    storage: StorageConfig = StorageConfig()
-    ingest: IngestConfig = IngestConfig()
+        Raises a clear error naming the provider/env var when either is wrong,
+        so the user never sees a cryptic auth failure from the backend.
+        """
+        if self.provider not in PRESETS:
+            raise ValueError(
+                f"Unknown provider '{self.provider}'. "
+                f"Choose one of: {', '.join(sorted(PRESETS))}."
+            )
+        p = dict(PRESETS[self.provider])
+        if self.root_model:
+            p["root_model"] = self.root_model
+        if self.sub_model:
+            p["sub_model"] = self.sub_model
 
-    @classmethod
-    def load(cls, config_path: str | Path | None = None) -> "RecurseConfig":
-        """Load config from file, falling back to defaults."""
-        if config_path is None:
-            config_path = Path("~/.recurse/config.yaml").expanduser()
-        else:
-            config_path = Path(config_path).expanduser()
+        api_key = os.environ.get(p["api_key_env"])
+        if not api_key:
+            raise RuntimeError(
+                f"Missing API key for provider '{self.provider}': "
+                f"set the {p['api_key_env']} environment variable. "
+                f"(export {p['api_key_env']}=...)"
+            )
+        p["api_key"] = api_key
+        return p
 
-        if not config_path.exists():
-            return cls()
 
-        with open(config_path) as f:
-            raw = yaml.safe_load(f) or {}
+def write_default_config(path: Path = DEFAULT_CONFIG_PATH) -> Path:
+    """Write the commented default config file. Never overwrites an existing one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+    return path
 
-        raw = _expand_env(raw)
-        return cls.model_validate(raw)
 
-    @property
-    def storage_path(self) -> Path:
-        return Path(self.storage.path).expanduser()
+def load_config(path: Path = DEFAULT_CONFIG_PATH) -> RecurseConfig:
+    """~/.recurse/config.yaml over defaults; create file with commented defaults if absent."""
+    write_default_config(path)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
-    @property
-    def cache_path(self) -> Path:
-        return self.storage_path
+    cfg = RecurseConfig()
+    for key in ("provider", "root_model", "sub_model", "max_iterations", "environment", "verbose"):
+        if raw.get(key) is not None:
+            setattr(cfg, key, raw[key])
+    if raw.get("storage_path"):
+        cfg.storage_path = Path(str(raw["storage_path"])).expanduser()
+
+    ingest = raw.get("ingest") or {}
+    if ingest.get("exclude") is not None:
+        cfg.ingest_exclude = list(ingest["exclude"])
+    if ingest.get("max_file_size_kb") is not None:
+        cfg.max_file_size_kb = int(ingest["max_file_size_kb"])
+    if ingest.get("max_total_files") is not None:
+        cfg.max_total_files = int(ingest["max_total_files"])
+    return cfg

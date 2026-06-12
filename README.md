@@ -1,120 +1,89 @@
-# Recurse — RLM-Powered Unlimited Context MCP Server
+# Recurse
 
-Give Claude Code unlimited context using local Qwen 3.5 models. When a codebase or document set is too large for Claude's context window, delegate to Recurse.
+Recurse gives AI coding agents the ability to reason over codebases and
+document sets of effectively unlimited size, using
+[Recursive Language Models](https://arxiv.org/abs/2512.24601) (RLMs). It runs
+as a local process and calls a hosted model API for inference — no GPU
+required.
+
+It ships in two forms sharing one engine:
+
+- **CLI:** `recurse "explain the auth flow" --path ./my-project`
+- **MCP server:** Claude Code delegates huge-context questions to it, with
+  memory that persists across sessions.
+
+## How it works
+
+An RLM wraps a language model so it can handle context far larger than its
+window:
+
+1. The huge context is loaded into a Python REPL as a variable — **never**
+   sent to the model directly.
+2. The root LM sees only the query + metadata, and writes Python to navigate
+   the context: peek, grep, partition + map over sub-LM calls, summarize.
+3. The loop ends when the model submits its final answer.
+
+Recurse builds on a vendored fork of the official
+[rlm library](https://github.com/alexzhang13/rlm) (`vendor/rlm`, mods tagged
+`RECURSE-MOD`) and adds what the library doesn't have: directory ingestion,
+persistent threads with conversation memory, provider presets with guardrails,
+a CLI, and an MCP server.
+
+## Install (dev)
 
 ```bash
-claude mcp add recurse --transport stdio -- python -m recurse.server
-```
-
-## How It Works
-
-Based on [Recursive Language Models (RLM)](https://arxiv.org/abs/2512.24601):
-
-1. Context is stored as a Python variable — **never fed into the LLM directly**
-2. A root LLM (Qwen 3.5 35B-A3B) writes Python code to inspect and decompose the context
-3. The root LLM calls `llm_query()` to delegate focused analysis to a sub-LLM (Qwen 3.5 9B)
-4. Loop continues until `FINAL(answer)` is output or max iterations reached
-
-The root LLM never sees the full context. It navigates it programmatically. This is how a 3B-active-parameter model can reason over 10M+ tokens.
-
-## Quick Start
-
-```bash
-# 1. Install Ollama and pull models
-ollama pull qwen3.5:35b-a3b
-ollama pull qwen3.5:9b
-
-# 2. Install Recurse
+python -m venv recurse/.venv && source recurse/.venv/bin/activate
+pip install -e vendor/rlm    # the FORK — never `pip install rlms` from PyPI
 pip install -e .
-
-# 3. Register with Claude Code
-claude mcp add recurse --transport stdio -- python -m recurse.server
+recurse init                 # writes ~/.recurse/config.yaml
 ```
 
-See [examples/setup_claude_code.md](examples/setup_claude_code.md) for full setup instructions.
+## Providers
 
-## Tools
+API keys come from env vars only — never stored in the config file.
 
-| Tool | Description |
-|------|-------------|
-| `recurse_query` | Answer questions over large context via RLM loop |
-| `recurse_ingest` | Pre-index a codebase or document set |
-| `recurse_status` | Check progress of a running query |
-| `recurse_threads` | List, inspect, or delete stored threads |
-
-## Example Usage
-
-```
-# In Claude Code:
-"Ingest my project at /Users/me/myapp"
-→ calls recurse_ingest(path="/Users/me/myapp", thread_id="myapp")
-
-"Explain how authentication works in myapp"
-→ calls recurse_query(query="Explain auth...", context_source="thread:myapp")
-```
-
-## Models
-
-| Role | Model | Active Params | Notes |
-|------|-------|---------------|-------|
-| Root (orchestrator) | `qwen3.5:35b-a3b` | 3B | MoE — fast, excellent at code gen |
-| Sub (analyst) | `qwen3.5:9b` | 9B | Beats 30B-class on comprehension |
-| Power mode | `qwen3.5:27b` | 27B | Ties GPT-5 mini on SWE-bench |
-
-All models run locally via Ollama. Also supports Qwen API (DashScope) and OpenRouter.
-
-## Configuration
-
-Copy `examples/config.example.yaml` to `~/.recurse/config.yaml`:
-
-```yaml
-models:
-  root: qwen3.5:35b-a3b
-  sub: qwen3.5:9b
-  base_url: http://localhost:11434/v1
-
-engine:
-  max_iterations: 15
-
-sandbox:
-  mode: subprocess  # or docker
-  timeout_seconds: 30
-```
-
-## Architecture
-
-```
-Claude Code → stdio → recurse/server.py (MCP)
-                           ↓
-                    recurse/engine/core.py (RLM loop)
-                     ├── qwen.py (Qwen 3.5 via Ollama)
-                     ├── sandbox.py (Python exec REPL)
-                     └── prompts.py (system prompts)
-                           ↓
-                    recurse/store/
-                     ├── context_store.py (file storage)
-                     └── cache.py (sub-call caching)
-```
-
-```
-# Usage
-To make it permanent for all projects, add this to your ~/.claude/CLAUDE.md:
-
-## Large Analysis
-When analyzing codebases with many files, use recurse_ingest first, then recurse_query instead of reading files individually.
-This preserves context window for reasoning, not file storage.
-
-What Recurse helps with:
-
-| Scenario | Without Recurse | With Recurse |
+| Provider | Models (root / sub) | Notes |
 |---|---|---|
-| "Explain auth in my 50k-line codebase" | Claude reads files → burns your context fast | Claude calls `recurse_query` → Qwen reads everything locally → Claude only receives the answer (~500 tokens) |
-| Your Claude Code context | Fills up with file contents | Stays clean |
-| Anthropic API tokens | Large, used for analysis | Small (just the answer) |
-| Local compute | None | Qwen models run on your machine |
+| `groq` (default) | `llama-3.3-70b-versatile` / `llama-3.1-8b-instant` | Free tier, but a **12K tokens-per-minute cap per request** — small contexts (≤ ~30K chars) only. Dev smoke tests. `export GROQ_API_KEY=...` |
+| `openai` (recommended) | `gpt-5-mini` / `gpt-5-nano` | The paper's benchmarked config; cents per query. `export OPENAI_API_KEY=...` ⚠️ **ChatGPT Pro ≠ API credits** — load ~$10 at platform.openai.com/billing first. |
+| `anthropic` | `claude-sonnet-4-6` / `claude-haiku-4-5` | Needs console.anthropic.com credits (separate from a Claude.ai subscription). `export ANTHROPIC_API_KEY=...` |
 
+Switch providers in `~/.recurse/config.yaml` (`provider: openai`) or per run
+with `--provider`.
 
+## CLI
+
+```bash
+recurse "what does the engine do?" --path ./recurse --thread self
+recurse "and how does it persist turns?" --thread self     # remembers the previous turn
+recurse ingest ./my-project --thread proj
+recurse threads                  # list; `recurse threads delete NAME`
+recurse history --thread proj
+recurse init
+```
+
+## MCP server (Claude Code)
+
+```bash
+claude mcp add recurse --transport stdio -- \
+    /ABS/PATH/TO/recurse/recurse/.venv/bin/python -m recurse.server
+```
+
+Tools: `recurse_query(query, context_source, thread_id)` with
+`context_source` of `path:/abs/dir` | `thread:<id>` | `inline:<text>`,
+`recurse_ingest(path, thread_id)`, `recurse_threads(action, thread_id)`.
+
+## Notes & gotchas
+
+- One RLM query = many LM calls (root per iteration + sub per chunk). Keep
+  `max_iterations` modest and watch the usage footer.
+- `environment: local` runs LM-generated code in-process — fine for trusted
+  personal use. Use `environment: docker` for untrusted contexts.
+- Groq HTTP 413 `rate_limit_exceeded` means the per-request 12K-token cap was
+  hit; Recurse's guardrail refuses oversized contexts before spending a call.
+- OpenAI `insufficient_quota` means a $0 credit balance, not a rate limit.
 
 ## License
 
-MIT
+MIT. The vendored `rlm` library is MIT (upstream license preserved at
+`vendor/rlm/LICENSE`).

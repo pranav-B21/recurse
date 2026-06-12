@@ -1,253 +1,153 @@
-"""Tests for the RLM engine loop (uses mock Qwen client — no Ollama required)."""
+"""Tests for recurse.engine: guardrail, context resolution, RLM construction."""
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+
 import pytest
 
+import recurse.engine as engine_mod
 from recurse.config import RecurseConfig
-from recurse.engine.core import (
-    RecurseEngine,
-    RLMResult,
-    _extract_code,
-    _extract_final,
-    _extract_final_var,
-    _truncate,
-)
-
-
-# ── helper extraction tests ────────────────────────────────────────────────
-
-
-def test_extract_final_simple():
-    assert _extract_final("FINAL<<<42>>>") == "42"
-
-
-def test_extract_final_multiline():
-    text = "Some thinking...\nFINAL<<<The answer\nis 42>>>"
-    assert _extract_final(text) == "The answer\nis 42"
-
-
-def test_extract_final_none():
-    assert _extract_final("No final here") is None
-
-
-def test_extract_final_var():
-    assert _extract_final_var("FINAL_VAR(result)") == "result"
-    assert _extract_final_var("nothing") is None
-
-
-def test_extract_code():
-    text = "Here is code:\n```python\nprint('hello')\n```"
-    assert _extract_code(text) == "print('hello')"
-
-
-def test_extract_code_multiple_blocks():
-    text = "```python\nx = 1\n```\nand\n```python\ny = 2\n```"
-    code = _extract_code(text)
-    assert "x = 1" in code
-    assert "y = 2" in code
-
-
-def test_extract_code_none():
-    assert _extract_code("no code blocks here") is None
-
-
-def test_truncate_short():
-    assert _truncate("hello", 100) == "hello"
-
-
-def test_truncate_long():
-    text = "a" * 1000
-    result = _truncate(text, 100)
-    assert len(result) < 300  # truncated + marker
-    assert "truncated" in result
-
-
-# ── RecurseEngine tests ────────────────────────────────────────────────────
+from recurse.engine import DIRECTIVE_ADDENDUM, RecurseEngine
 
 
 @pytest.fixture
-def config():
-    return RecurseConfig()
+def config(tmp_path, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    return RecurseConfig(provider="groq", storage_path=tmp_path / "threads", verbose=False)
 
 
 @pytest.fixture
-def mock_engine(config, tmp_path):
-    """Engine with mocked Qwen client and temp storage."""
-    config.storage.path = str(tmp_path / "threads")
-    engine = RecurseEngine(config)
-    return engine
+def engine(config):
+    return RecurseEngine(config)
 
 
-def run(coro):
-    return asyncio.run(coro)
+class _ExplodingRLM:
+    """Stands in for RLM to prove no client is ever constructed."""
+
+    def __init__(self, *args, **kwargs):
+        raise AssertionError("RLM was constructed — guardrail should fire first")
 
 
-def test_engine_final_on_first_response(mock_engine):
-    """Engine should return immediately when first response contains FINAL()."""
-    mock_engine.qwen.root_completion = AsyncMock(return_value="FINAL<<<The answer is 42>>>")
-
-    result = run(mock_engine.query(
-        query="What is the answer?",
-        context="The answer is 42.",
-        thread_id="test",
-    ))
-
-    assert isinstance(result, RLMResult)
-    assert "42" in result.answer
-    assert result.iterations_used == 1
-    mock_engine.qwen.root_completion.assert_called_once()
+def test_guardrail_refuses_oversized_context_without_api_call(engine, monkeypatch):
+    monkeypatch.setattr(engine_mod, "RLM", _ExplodingRLM)
+    big = "x" * 200_000  # ≈50K tokens >> 60% of Groq's 12K TPM
+    with pytest.raises(RuntimeError, match="provider 'groq'"):
+        engine.query("find the needle", "inline:" + big)
 
 
-def test_engine_code_then_final(mock_engine):
-    """Engine executes code on iteration 1, gets FINAL() on iteration 2."""
-    responses = [
-        "I'll search for it.\n```python\nprint(CONTEXT[:100])\n```",
-        "FINAL<<<Found it: 42>>>",
-    ]
-    mock_engine.qwen.root_completion = AsyncMock(side_effect=responses)
-
-    result = run(mock_engine.query(
-        query="Find the number",
-        context="The number is 42 in here.",
-        thread_id="test",
-    ))
-
-    assert "42" in result.answer
-    assert result.iterations_used == 2
+def test_guardrail_allows_small_context(engine):
+    engine._guardrail("small context")  # must not raise
 
 
-def test_engine_final_var(mock_engine):
-    """Engine resolves FINAL_VAR from sandbox globals."""
-    async def code_then_final_var(system_prompt, messages):
-        if len(messages) == 1:
-            return "```python\nanswer = 'resolved from var'\n```"
-        return "FINAL_VAR(answer)"
-
-    mock_engine.qwen.root_completion = AsyncMock(side_effect=code_then_final_var)
-
-    result = run(mock_engine.query(
-        query="Get the answer",
-        context="some context",
-        thread_id="test",
-    ))
-
-    assert result.answer == "resolved from var"
+def test_guardrail_disabled_when_no_tpm_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk_test")
+    eng = RecurseEngine(RecurseConfig(provider="openai", storage_path=tmp_path))
+    eng._guardrail("y" * 200_000)  # no limit → no raise
 
 
-def test_engine_max_iterations_triggers_force_final(mock_engine):
-    """When max_iterations is reached, engine calls _force_final."""
-    # Always return code, never FINAL
-    mock_engine.qwen.root_completion = AsyncMock(
-        return_value="Still thinking...\n```python\nprint('iteration')\n```"
+def test_resolve_context_inline(engine):
+    assert engine._resolve_context("inline:hello world", "t") == "hello world"
+
+
+def test_resolve_context_bare_text_is_inline(engine):
+    assert engine._resolve_context("just some text", "t") == "just some text"
+
+
+def test_resolve_context_thread(engine):
+    d = engine.store.base_path / "t1"
+    d.mkdir(parents=True)
+    (d / "context.txt").write_text("stored context")
+    assert engine._resolve_context("thread:t1", "ignored") == "stored context"
+
+
+def test_resolve_context_path_ingests_into_thread(engine, tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.py").write_text("print('hi')")
+    ctx = engine._resolve_context(f"path:{src}", "t2")
+    assert "=== FILE: main.py ===" in ctx
+    assert engine.store.has_thread("t2")
+
+
+def test_resolve_context_bare_dir_ingests(engine, tmp_path):
+    src = tmp_path / "src2"
+    src.mkdir()
+    (src / "a.txt").write_text("content here")
+    ctx = engine._resolve_context(str(src), "t3")
+    assert "=== FILE: a.txt ===" in ctx
+
+
+def test_store_operations_need_no_api_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    eng = RecurseEngine(RecurseConfig(provider="groq", storage_path=tmp_path))
+    assert eng.store.list_threads() == []  # no key required until a query runs
+    with pytest.raises(RuntimeError, match="GROQ_API_KEY"):
+        eng.query("q", "inline:ctx")
+
+
+class _RecordingRLM:
+    instances: list = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        _RecordingRLM.instances.append(self)
+
+
+def test_build_rlm_wires_preset(engine, monkeypatch):
+    monkeypatch.setattr(engine_mod, "RLM", _RecordingRLM)
+    _RecordingRLM.instances = []
+    import os
+
+    rlm = engine._build_rlm()
+    kw = rlm.kwargs
+    assert os.environ["RLM_MAX_OUTPUT_CHARS"] == "4000"  # groq preset, drives vendor Mod #1
+    assert kw["backend"] == "openai"
+    assert kw["backend_kwargs"]["base_url"] == "https://api.groq.com/openai/v1"
+    assert kw["backend_kwargs"]["model_name"] == "llama-3.3-70b-versatile"
+    assert kw["other_backend_kwargs"][0]["model_name"] == "llama-3.1-8b-instant"
+    assert kw["custom_system_prompt"].endswith(DIRECTIVE_ADDENDUM)
+
+
+def test_build_rlm_sub_model_same_skips_other_backends(tmp_path, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.setattr(engine_mod, "RLM", _RecordingRLM)
+    cfg = RecurseConfig(provider="groq", sub_model="same", storage_path=tmp_path)
+    rlm = RecurseEngine(cfg)._build_rlm()
+    assert "other_backends" not in rlm.kwargs
+
+
+def test_build_rlm_falls_back_when_other_backends_rejected(engine, monkeypatch):
+    class _OldRLM(_RecordingRLM):
+        def __init__(self, **kwargs):
+            if "other_backends" in kwargs:
+                raise TypeError("unexpected keyword argument 'other_backends'")
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "RLM", _OldRLM)
+    with pytest.warns(UserWarning, match="single model"):
+        rlm = engine._build_rlm()
+    assert "other_backends" not in rlm.kwargs
+
+
+def test_query_persists_turn(engine, monkeypatch):
+    fake_result = SimpleNamespace(
+        response="the answer", execution_time=1.5, usage_summary="usage"
     )
-    # Override _force_final to return a known answer
-    async def fake_force_final(conversation, system_prompt, trajectory):
-        return RLMResult(
-            answer="Forced final answer",
-            iterations_used=0,
-            sub_calls_made=0,
-            tokens_used=0,
-            cached_hits=0,
-            trajectory_summary="",
-        )
-    mock_engine._force_final = fake_force_final
 
-    result = run(mock_engine.query(
-        query="Q",
-        context="C",
-        thread_id="test",
-        max_iterations=3,
-    ))
+    class _FakeRLM:
+        def __init__(self, **kwargs):
+            pass
 
-    assert result.answer == "Forced final answer"
-    assert result.iterations_used == 3
+        def completion(self, prompt, root_prompt):
+            assert prompt == "some context"
+            assert root_prompt == "the question?"
+            return fake_result
 
+    monkeypatch.setattr(engine_mod, "RLM", _FakeRLM)
+    result = engine.query("the question?", "inline:some context", thread_id="t9")
+    assert result is fake_result
 
-def test_engine_sub_call_via_llm_query(mock_engine):
-    """llm_query() registered in sandbox should call sub_completion."""
-    call_log = []
-
-    async def mock_sub(query, context):
-        call_log.append(query)
-        return "sub answer"
-
-    mock_engine.qwen.sub_completion = AsyncMock(side_effect=mock_sub)
-
-    responses = [
-        "```python\nresult = llm_query('sub question', 'some context')\nprint(result)\n```",
-        "FINAL<<<done>>>",
-    ]
-    mock_engine.qwen.root_completion = AsyncMock(side_effect=responses)
-
-    result = run(mock_engine.query(
-        query="Test sub-call",
-        context="context data",
-        thread_id="test",
-    ))
-
-    assert len(call_log) == 1
-    assert call_log[0] == "sub question"
-
-
-def test_engine_cache_hit(mock_engine):
-    """Same sub-query+context should hit cache on second call."""
-    sub_call_count = 0
-
-    async def mock_sub(query, context):
-        nonlocal sub_call_count
-        sub_call_count += 1
-        return "cached result"
-
-    mock_engine.qwen.sub_completion = AsyncMock(side_effect=mock_sub)
-
-    # Two iterations calling the same llm_query
-    responses = [
-        "```python\nr1 = llm_query('same q', 'same c')\nprint(r1)\n```",
-        "```python\nr2 = llm_query('same q', 'same c')\nprint(r2)\n```",
-        "FINAL<<<done>>>",
-    ]
-    mock_engine.qwen.root_completion = AsyncMock(side_effect=responses)
-
-    result = run(mock_engine.query(
-        query="Cache test",
-        context="ctx",
-        thread_id="test",
-    ))
-
-    # Second call should be a cache hit, not a real sub call
-    assert sub_call_count == 1
-    assert result.cached_hits == 1
-
-
-def test_engine_status_tracking(mock_engine):
-    """Status should reflect current state during execution."""
-    mock_engine.qwen.root_completion = AsyncMock(return_value="FINAL<<<done>>>")
-
-    run(mock_engine.query(
-        query="Q",
-        context="C",
-        thread_id="status-test",
-    ))
-
-    status = mock_engine.get_status("status-test")
-    assert status.state == "complete"
-
-
-def test_engine_no_code_block_nudge(mock_engine):
-    """When root LLM returns no code, engine adds a nudge message."""
-    responses = [
-        "I'm thinking about this...",  # no code
-        "FINAL<<<42>>>",
-    ]
-    mock_engine.qwen.root_completion = AsyncMock(side_effect=responses)
-
-    result = run(mock_engine.query(
-        query="Q",
-        context="C",
-        thread_id="test",
-    ))
-
-    assert "42" in result.answer
-    # Should have been called twice
-    assert mock_engine.qwen.root_completion.call_count == 2
+    turns = engine.store.get_turns("t9")
+    assert len(turns) == 1
+    assert turns[0]["query"] == "the question?"
+    assert turns[0]["answer"] == "the answer"
+    assert turns[0]["meta"]["provider"] == "groq"

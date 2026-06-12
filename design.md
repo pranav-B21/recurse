@@ -1,760 +1,566 @@
-# DESIGN.md — Recurse: RLM-Powered Unlimited Context MCP Server
+# DESIGN.md — Recurse
 
-> This document is the source of truth for building this project. Claude Code should reference it throughout development.
+> Source of truth for this project. Claude Code: read this file top-to-bottom before writing any code. Also read the "Gotchas" section twice.
 
 ---
 
 ## 1. What This Is
 
-An MCP server that gives Claude Code unlimited context by using Recursive Language Models (RLMs) powered by Qwen 3.5. When Claude Code encounters a codebase, document set, or conversation history too large for its context window, it delegates to this tool. The RLM decomposes the input, recursively analyzes it using local Qwen 3.5 models, and returns a synthesized answer.
+Recurse gives AI coding agents the ability to reason over codebases and document sets of effectively unlimited size, using Recursive Language Models (RLMs). It runs as a local process and calls a hosted model API for inference — no GPU required.
 
-**One sentence:** `claude mcp add recurse` and Claude Code can now reason over million-token codebases using local Qwen 3.5 models.
+It ships in two forms sharing one engine:
 
----
+- **CLI:** `recurse "explain the auth flow" --path ./my-project`
+- **MCP server:** `claude mcp add recurse` → Claude Code delegates huge-context questions to it, with memory that persists across sessions.
 
-## 2. How RLMs Work (Reference for Implementation)
-
-Based on the paper: [arxiv.org/abs/2512.24601](https://arxiv.org/abs/2512.24601)
-Reference implementation: [github.com/alexzhang13/rlm](https://github.com/alexzhang13/rlm) (MIT licensed)
-Inspiration: [github.com/WingchunSiu/Monolith](https://github.com/WingchunSiu/Monolith)
-
-The core idea:
-
-1. User provides a **query** and a **context** (could be millions of tokens)
-2. The context is **never fed into the LLM directly** — it's stored as a Python variable in a sandboxed REPL
-3. A **root LLM** (Qwen 3.5) receives only the query + metadata about the context (length, type)
-4. The root LLM writes Python code in the REPL to peek at, grep through, split, and analyze the context
-5. Inside the REPL, the root LLM can call `llm_query(sub_query, sub_context)` to delegate focused analysis to a **sub-LLM** (smaller/cheaper Qwen 3.5)
-6. After N iterations, the root LLM outputs `FINAL(answer)` or `FINAL_VAR(variable_name)`
-
-The root LLM never sees the full context. It writes code to navigate it. Sub-LLMs see small focused chunks. This is why a 27B model can effectively reason over 10M+ tokens.
+This recreates the user-facing behavior of [Monolith](https://github.com/WingchunSiu/Monolith) (TreeHacks 2026 winner: RLM-as-a-service MCP tool with persistent memory) — but as a plain local process instead of Modal + Cloudflare infrastructure, and built on a **vendored fork** of the official RLM library that we can read and modify.
 
 ---
 
-## 3. Qwen 3.5 Model Strategy
+## 2. Current State — What Is ALREADY Done (do not redo)
 
-All Qwen 3.5 models: Apache 2.0, 256K native context, 201 languages, thinking mode (`<think>...</think>`), native tool calling, natively multimodal (text + image + video).
+The environment is set up and verified. Claude Code should build on this, not recreate it.
 
-### Model Roles
+**Repo root:** `~/Documents/GitHub/recurse/`
 
-| Role | Model | Active Params | Why |
-|------|-------|---------------|-----|
-| **Root LLM** (orchestrator) | `qwen3.5:35b-a3b` | 3B | MoE — only 3B active params despite 35B total. Runs on 8GB VRAM. Surpasses previous-gen 235B. Fast inference, smart enough to write good decomposition code. |
-| **Sub-LLM** (focused analysis) | `qwen3.5:9b` | 9B | Beats previous-gen 30B. Strong at focused reading comprehension. Cheap and fast for hundreds of sub-calls per query. |
-| **Power mode** (optional) | `qwen3.5:27b` | 27B | Dense model, all 27B active. Ties GPT-5 mini on SWE-bench. Use when root needs maximum reasoning quality. Needs 22GB+ RAM. |
-| **Edge/fast mode** (optional) | `qwen3.5:4b` | 4B | For extremely resource-constrained environments or as a ultra-cheap sub-LLM. |
-
-### Default Configuration
-
-```yaml
-models:
-  root: qwen3.5:35b-a3b    # orchestrates decomposition
-  sub: qwen3.5:9b           # handles focused sub-queries
+```
+recurse/                        # repo root
+├── CLAUDE.md                   # points Claude Code here
+├── DESIGN.md                   # this file
+├── README.md
+├── pyproject.toml
+├── recurse/                    # Python package dir (target for our code)
+│   └── .venv/                  # the venv lives here (quirk — harmless, gitignored)
+├── vendor/
+│   └── rlm/                    # FORK of alexzhang13/rlm — editable-installed, MODIFIABLE
+├── examples/
+└── tests/
 ```
 
-### Why This Pairing Works
+**Verified facts:**
 
-The RLM architecture means the root LLM's job is to **write good Python code** that decomposes context — it doesn't need to understand the full content itself. The 35B-A3B is extremely good at code generation (it surpasses the previous 235B on coding benchmarks) while only activating 3B parameters per token, making it fast. The sub-LLM needs to **read and comprehend** focused chunks of text. The 9B model beats models 3x its size on comprehension tasks and runs fast enough to handle dozens of sub-calls per query.
+1. `vendor/rlm` is editable-installed into the venv. Confirmed:
+   ```bash
+   python -c "import rlm; print(rlm.__file__)"
+   # → .../recurse/vendor/rlm/rlm/__init__.py   ✓
+   ```
+   Edits to `vendor/rlm/rlm/*.py` take effect immediately — no reinstall.
 
-### Serving
+2. **The RLM loop works end-to-end on this machine.** A smoke test via Groq (free tier, `llama-3.3-70b-versatile`) ran 14 iterations: the root LM peeked at the context, chunked it, grepped, and executed code in the REPL. The mechanism is proven.
 
-All models served locally via **Ollama** using the OpenAI-compatible API at `http://localhost:11434/v1`. The `alexzhang13/rlm` library already supports OpenAI-compatible endpoints, so this requires minimal integration work.
+3. **Two failure modes were observed and must inform the build** (see §6 and §7):
+   - Groq free tier has a **12,000 tokens-per-minute hard cap per request**. The run died with `413 rate_limit_exceeded` when accumulated conversation history + a huge REPL output pushed one request to 12,226 tokens.
+   - The root cause of the blowup: the model printed an entire **40,000-character chunk** into REPL output, which the library fed back into the next root call **untruncated (or insufficiently truncated)**. Output truncation is mandatory work.
+   - `llama-3.3-70b-versatile` **flails at the RLM protocol** — it never found the needle, fixated on irrelevant searches, and ignored the "don't print the whole context" instruction. Open models need more directive prompts; `gpt-5-mini` is the reliable choice.
 
-```bash
-# User setup (one time)
-ollama pull qwen3.5:35b-a3b
-ollama pull qwen3.5:9b
-```
+4. The user currently has **no OpenAI API credits** (ChatGPT Pro ≠ API credits). Groq (free) works for small tests now; OpenAI `gpt-5-mini` is the target once ~$10 of credits are loaded. The design is provider-agnostic via config so this is a config swap, not a code change.
 
-For users with more powerful hardware or who want API access, also support:
-- **vLLM** — for GPU-optimized serving (`http://localhost:8000/v1`)
-- **Qwen API** (DashScope) — Alibaba's hosted API, OpenAI-compatible
-- **OpenRouter** — route to any Qwen 3.5 variant via API
+---
 
-The backend is configured in `~/.recurse/config.yaml` and the engine auto-detects which models are available.
+## 3. How RLMs Work (mechanism reference)
 
-### Thinking Mode
+Sources: [paper](https://arxiv.org/abs/2512.24601) · [blog](https://alexzhang13.github.io/blog/2025/rlm/) · [repo](https://github.com/alexzhang13/rlm)
 
-Qwen 3.5 defaults to thinking mode (`<think>...</think>` before response). For the **root LLM**, enable thinking — it helps the model plan its decomposition strategy. For the **sub-LLM**, disable thinking (`/no_think` or set in API) to save tokens and speed up sub-calls. The sub-LLM should just answer the focused question directly.
+An RLM wraps a language model so it can handle context far larger than its window. `rlm.completion(prompt=context, root_prompt=query)` is a drop-in for a normal LM call. Internally:
+
+1. The huge **context** is loaded into a Python REPL as a variable — **never** sent to the model directly.
+2. The **root LM** (depth 0) sees only the query + metadata (context exists, its size).
+3. The root LM writes Python into the REPL to navigate the context. Emergent strategies: **peek** (`context[:2000]`), **grep** (regex/keyword filters), **partition + map** (chunk it, send chunks to a sub-LM), **summarize** (fold results).
+4. The REPL exposes `llm_query(query, context)` and `batch_llm_query(...)` — the recursive sub-calls (depth 1, the current max).
+5. The loop ends when the root LM emits `FINAL(answer)` or `FINAL_VAR(varname)`, or `max_iterations` is hit.
+
+Headline result: RLM(GPT-5-mini) beat plain GPT-5 by ~34 points on the 132k-token OOLONG split at similar cost, with no degradation past 10M tokens. The root LM's real job is **writing good navigation code** — its own context never clogs up.
+
+---
+
+## 4. The Vendored RLM Library
+
+We build ON the fork in `vendor/rlm`, never reimplement the loop. Verified public API (exact signature used in the working smoke test):
 
 ```python
-# Root LLM call — thinking enabled (default)
-root_response = client.chat.completions.create(
-    model="qwen3.5:35b-a3b",
-    messages=[{"role": "user", "content": prompt}],
-    temperature=0.6,
-    top_p=0.95,
-    extra_body={"top_k": 20}
+from rlm import RLM
+from rlm.logger import RLMLogger
+
+rlm = RLM(
+    backend="openai",                      # also: "anthropic", "openrouter", "portkey", "litellm", "vllm"
+    backend_kwargs={
+        "api_key": "...",
+        "model_name": "gpt-5-mini",
+        # "base_url": "https://api.groq.com/openai/v1",   # optional — any OpenAI-compatible host
+    },
+    environment="local",                   # REPL runs in-process; also "docker", "modal"
+    max_iterations=30,                     # library default observed: 30; max_depth default: 1
+    logger=RLMLogger(log_dir="./logs"),    # optional JSONL trajectories (works with their visualizer)
+    verbose=True,                          # rich console output of iterations
+    # other_backends=["openai"],                          # EXPERIMENTAL: separate sub-LM
+    # other_backend_kwargs=[{...}],                       # must match other_backends order
 )
 
-# Sub-LLM call — thinking disabled for speed
-sub_response = client.chat.completions.create(
-    model="qwen3.5:9b",
-    messages=[
-        {"role": "system", "content": "/no_think"},
-        {"role": "user", "content": sub_prompt}
-    ],
-    temperature=0.3  # lower temp for focused analysis
-)
+result = rlm.completion(prompt=huge_context, root_prompt="the question")
+result.response          # final answer string
+result.execution_time    # seconds
+result.usage_summary     # aggregated token usage
 ```
+
+**Internal files (paths verified from live tracebacks on this machine):**
+
+| File | What's there | Why we care |
+|---|---|---|
+| `vendor/rlm/rlm/core/rlm.py` | `completion()` (~line 402) — the main loop; `_completion_turn()` (~line 655) — one iteration: LM call → parse → execute | Where iteration history accumulates; where REPL output is appended back to the conversation → **truncation mod lives here or adjacent** |
+| `vendor/rlm/rlm/core/lm_handler.py` | Routes completions to the right client (`get_client(model).completion(prompt)`) | Where root vs sub model routing happens |
+| `vendor/rlm/rlm/clients/openai.py` | OpenAI-compatible client (~line 111: `chat.completions.create`), honors `base_url`, has `_normalize_sampling_args` | Confirms Groq/any OpenAI-compatible host works via `base_url` |
+
+**What the library does NOT provide — this is the entire Recurse build:**
+
+| Gap | Recurse adds |
+|---|---|
+| No way to turn a folder into context | `ingest` — walk a directory, concatenate files with `=== FILE:` headers |
+| No persistence between runs | Thread store on local disk (`~/.recurse/threads/`) |
+| No conversation memory | Append each Q&A turn to the thread context (the Monolith feature) |
+| No CLI | `recurse "query" --path ./dir` |
+| No agent integration | MCP server exposing tools to Claude Code |
+| Insufficient REPL-output truncation | **Vendor mod #1** — hard clamp, configurable (§7) |
+| Single model for root + sub by default | Root/sub split via `other_backends` (experimental — verify, with single-model fallback) |
 
 ---
 
-## 4. Architecture
+## 5. Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                    Claude Code                        │
-│               (or any MCP client)                     │
-└──────────────────┬───────────────────────────────────┘
-                   │ MCP (stdio)
-                   ▼
-┌──────────────────────────────────────────────────────┐
-│                  recurse/server.py                     │
-│                  MCP Server                            │
-│                                                       │
-│  Tools:                                               │
-│    recurse_query    — ask questions over large context │
-│    recurse_ingest   — index a codebase or doc set     │
-│    recurse_status   — check progress of running query │
-│    recurse_threads  — list/inspect persistent threads │
-│                                                       │
-└──────────────────┬───────────────────────────────────┘
-                   │
-                   ▼
-┌──────────────────────────────────────────────────────┐
-│               recurse/engine/core.py                  │
-│               RLM Engine                              │
-│                                                       │
-│  1. Load context from ContextStore                    │
-│  2. Send query + context metadata to root LLM         │
-│  3. Root LLM writes Python → execute in Sandbox       │
-│  4. Sandbox calls llm_query() → routed to sub-LLM    │
-│  5. Loop until FINAL() or max_iterations              │
-│  6. Cache result, return answer                       │
-│                                                       │
-│  ┌────────────────────────────────────────────────┐   │
-│  │          recurse/engine/sandbox.py             │   │
-│  │          Sandboxed Python REPL                 │   │
-│  │                                                │   │
-│  │  Globals:                                      │   │
-│  │    CONTEXT: str  — the full context as string  │   │
-│  │    llm_query(query, context) → str             │   │
-│  │    batch_llm_query(queries) → list[str]        │   │
-│  │                                                │   │
-│  │  Execution: Docker container (default)         │   │
-│  │             or subprocess with restricted exec │   │
-│  └────────────────────────────────────────────────┘   │
-│                                                       │
-│  ┌────────────────────────────────────────────────┐   │
-│  │          recurse/engine/qwen.py                │   │
-│  │          Qwen 3.5 Client                       │   │
-│  │                                                │   │
-│  │  Connects to Ollama / vLLM / DashScope API     │   │
-│  │  Handles thinking mode toggle                  │   │
-│  │  Manages root vs sub model routing             │   │
-│  │  Token counting and budget tracking            │   │
-│  └────────────────────────────────────────────────┘   │
-│                                                       │
-└──────────────────────────────────────────────────────┘
-                   │
-                   ▼
-┌──────────────────────────────────────────────────────┐
-│             recurse/store/                             │
-│             Context Store                             │
-│                                                       │
-│  ~/.recurse/threads/{thread_id}/                      │
-│    manifest.json       — file list + content hashes   │
-│    files/              — individual file contents      │
-│    conversations/      — past Q&A pairs               │
-│    cache/              — cached sub-call results       │
-│                                                       │
-└──────────────────────────────────────────────────────┘
+   Claude Code                    Terminal
+        │ MCP (stdio)                │ args
+        ▼                           ▼
+  recurse/server.py           recurse/cli.py
+        └────────────┬──────────────┘
+                     ▼
+            recurse/engine.py  (RecurseEngine)
+              • resolve context (thread:/path:/inline:)
+              • build RLM() from config
+              • guardrails (size estimate vs provider limits)
+              • rlm.completion(prompt=context, root_prompt=query)
+              • persist the Q&A turn
+                     │
+         ┌───────────┴────────────┐
+         ▼                        ▼
+   vendor/rlm  (fork)       recurse/store.py
+   loop + REPL + sub-calls  ~/.recurse/threads/{id}/
+         │                    context.txt, turns/, manifest.json
+         ▼
+   Hosted API (Groq free / OpenAI / Anthropic)
 ```
+
+Real logic = five files: `config.py`, `engine.py`, `store.py`, `cli.py`, `server.py`. Everything else is the vendored library.
 
 ---
 
-## 5. MCP Tool Specifications
+## 6. Provider & Model Strategy
 
-### 5.1 `recurse_query`
+Provider is a config choice, not a code path. The engine constructs `backend_kwargs` from a preset.
 
-Primary tool. Claude Code calls this to reason over large context.
+| Provider | Models (root / sub) | Cost | Verdict from live testing |
+|---|---|---|---|
+| **Groq** (current) | `llama-3.3-70b-versatile` / `llama-3.1-8b-instant` | Free tier | Loop works. **12K TPM cap per request** → only viable for small contexts (≤ ~30K chars) and short runs. Model flails at protocol — needs directive prompts. Use for dev smoke tests only. |
+| **OpenAI** (target) | `gpt-5-mini` / `gpt-5-nano` | ~cents/query | The paper's benchmarked config; follows the protocol reliably; generous limits. **Requires loading API credits (~$10)** — ChatGPT Pro does not include API access. Switch here for real work. |
+| **Anthropic** | `claude-sonnet-4-6` / `claude-haiku-4-5` | low | Native `backend="anthropic"`. Needs console.anthropic.com credits (separate from Claude.ai subscription). |
 
-```python
-@server.tool()
-async def recurse_query(
-    query: str,
-    # Context source — one of:
-    #   "thread:{thread_id}" — use stored context from a thread
-    #   "path:/absolute/path" — read from filesystem (will auto-ingest)
-    #   "inline:..." — context provided directly (for smaller inputs)
-    context_source: str,
-    thread_id: str = "default",
-    max_iterations: int = 15,
-    token_budget: int | None = None,  # max tokens to spend, None = unlimited
-) -> dict:
-    """
-    Returns:
-        answer: str — the final answer
-        iterations_used: int
-        sub_calls_made: int
-        tokens_used: int
-        cached_hits: int
-        trajectory_summary: str — brief description of what the RLM did
-    """
-```
+**Engine guardrail (required):** before running, estimate context tokens (`len(context) // 4`). If the active provider preset declares a `tpm_limit` and the estimate exceeds ~60% of it, refuse with a clear error telling the user to shrink the context or switch provider. This converts the cryptic 413 we hit into an actionable message.
 
-**Example Claude Code usage:**
-```
-User: "Explain how authentication works in this codebase"
-Claude Code: [calls recurse_query(query="Explain how authentication works...", context_source="path:/users/me/project")]
-```
-
-### 5.2 `recurse_ingest`
-
-Pre-indexes a codebase or document set into a thread. Makes subsequent queries faster.
-
-```python
-@server.tool()
-async def recurse_ingest(
-    path: str,             # directory or file to ingest
-    thread_id: str = "default",
-    include_patterns: list[str] | None = None,  # e.g. ["*.py", "*.ts"]
-    exclude_patterns: list[str] | None = None,  # e.g. ["node_modules", ".git"]
-) -> dict:
-    """
-    Returns:
-        files_ingested: int
-        total_size_bytes: int
-        total_tokens_estimate: int
-        file_tree: str — compact representation of the codebase structure
-    """
-```
-
-### 5.3 `recurse_status`
-
-For long-running queries — reports what the RLM is currently doing.
-
-```python
-@server.tool()
-async def recurse_status(
-    thread_id: str = "default",
-) -> dict:
-    """
-    Returns:
-        state: str — "idle" | "decomposing" | "analyzing" | "aggregating" | "complete"
-        current_iteration: int
-        max_iterations: int
-        sub_calls_completed: int
-        elapsed_seconds: float
-        partial_findings: list[str]  # what the RLM has found so far
-    """
-```
-
-### 5.4 `recurse_threads`
-
-List and inspect persistent threads.
-
-```python
-@server.tool()
-async def recurse_threads(
-    action: str = "list",  # "list" | "inspect" | "delete"
-    thread_id: str | None = None,
-) -> dict:
-    """
-    list: returns all thread IDs with metadata
-    inspect: returns details of a specific thread (file count, size, last query)
-    delete: removes a thread and its stored context
-    """
-```
+**Root/sub split:** attempt `other_backends` per the API above. If it errors or behaves oddly in this library version (it's experimental), fall back to a single model for both and log a warning. Engine takes a `sub_model: same` option to force the fallback.
 
 ---
 
-## 6. Core Engine Implementation
+## 7. Vendor Modifications (the point of the fork)
 
-### 6.1 RLM Loop (`recurse/engine/core.py`)
+Keep mods minimal, surgical, and documented. Each mod gets a `# RECURSE-MOD:` comment at the site.
 
-This is the heart of the system. Reference `alexzhang13/rlm` for the loop structure.
+### Mod #1 — REPL output truncation (REQUIRED, Phase 2)
 
-```python
-class RecurseEngine:
-    def __init__(self, config: RecurseConfig):
-        self.qwen = QwenClient(config.models)
-        self.sandbox = Sandbox(config.sandbox_mode)
-        self.store = ContextStore(config.storage_path)
-        self.cache = ResultCache(config.cache_path)
+**Problem (observed live):** the model printed a 40K-char chunk; the library fed it back into the next root call; accumulated history blew Groq's per-request token cap (413).
 
-    async def query(self, query: str, context: str, thread_id: str,
-                    max_iterations: int = 15, token_budget: int | None = None) -> RLMResult:
-        # 1. Load context into sandbox
-        self.sandbox.set_variable("CONTEXT", context)
-        self.sandbox.set_variable("CONTEXT_LENGTH", len(context))
-
-        # 2. Register llm_query function in sandbox
-        self.sandbox.register_function("llm_query", self._make_sub_query_fn(thread_id))
-        self.sandbox.register_function("batch_llm_query", self._make_batch_query_fn(thread_id))
-
-        # 3. Build system prompt for root LLM
-        system_prompt = self._build_system_prompt(context_length=len(context))
-
-        # 4. RLM loop
-        conversation = [{"role": "user", "content": f"Query: {query}\n\nContext length: {len(context)} characters."}]
-        trajectory = []
-
-        for i in range(max_iterations):
-            # Get root LLM response (with thinking enabled)
-            response = await self.qwen.root_completion(system_prompt, conversation)
-
-            # Check for FINAL() or FINAL_VAR()
-            final = self._extract_final(response)
-            if final is not None:
-                return RLMResult(answer=final, iterations=i+1, trajectory=trajectory)
-
-            # Extract code blocks and execute in sandbox
-            code = self._extract_code(response)
-            if code:
-                output = await self.sandbox.execute(code)
-                # Truncate output if too long
-                output = self._truncate(output, max_chars=50000)
-                conversation.append({"role": "assistant", "content": response})
-                conversation.append({"role": "user", "content": f"[Execution Output]\n{output}"})
-                trajectory.append({"iteration": i, "code": code, "output": output[:500]})
-            else:
-                # No code — root LLM is thinking/planning, continue
-                conversation.append({"role": "assistant", "content": response})
-                conversation.append({"role": "user", "content": "Continue. Write code to analyze the context, or output FINAL(answer) when ready."})
-
-        # Max iterations hit — force final answer
-        return await self._force_final(conversation, trajectory)
-
-    def _make_sub_query_fn(self, thread_id: str):
-        """Creates the llm_query() function available in the sandbox."""
-        async def llm_query(query: str, context: str = "") -> str:
-            # Check cache first
-            cache_key = self.cache.key(query, context)
-            cached = self.cache.get(cache_key)
-            if cached:
-                return cached
-
-            # Call sub-LLM (thinking disabled for speed)
-            result = await self.qwen.sub_completion(query, context)
-            self.cache.set(cache_key, result)
-            return result
-        return llm_query
-```
-
-### 6.2 System Prompt for Root LLM (`recurse/engine/prompts.py`)
-
-The root LLM needs a specific prompt that teaches it the RLM pattern. Based on the original paper's prompt structure:
+**Fix:** in `vendor/rlm/rlm/core/rlm.py` (locate where code-execution output is appended to the message history inside `_completion_turn` / the loop in `completion`), clamp the output before appending:
 
 ```python
-ROOT_SYSTEM_PROMPT = """You are an AI assistant with access to a Python REPL environment.
-A potentially very large context has been loaded into the variable `CONTEXT` (a string).
-The context has {context_length} characters.
-
-Your task: answer the user's query by examining the context programmatically.
-
-You have these tools in the REPL:
-- `CONTEXT` — the full context string (DO NOT try to print it all)
-- `CONTEXT_LENGTH` — length in characters
-- `llm_query(query: str, context: str) -> str` — ask a sub-LLM to analyze a snippet
-- `batch_llm_query(items: list[tuple[str, str]]) -> list[str]` — parallel sub-LLM calls
-
-Strategy:
-1. RECON: Check CONTEXT_LENGTH. Peek at CONTEXT[:2000] and CONTEXT[-2000:] to understand format.
-2. DECOMPOSE: Write Python to split context into meaningful chunks (by file, section, paragraph).
-3. FILTER: Use regex, keywords, or string operations to find relevant chunks.
-4. ANALYZE: Call llm_query() on each relevant chunk with a focused sub-question.
-5. SYNTHESIZE: Combine sub-answers into a final response.
-
-Rules:
-- Write code in ```python blocks. You'll see execution output.
-- NEVER print the entire CONTEXT. Always slice or filter first.
-- Use llm_query() for any reasoning over text. Don't try to reason about content yourself.
-- Use batch_llm_query() when you have multiple independent sub-questions.
-- When done, output FINAL(your answer here) or FINAL_VAR(variable_name) to return.
-- If you can't find the answer, say so in FINAL() — don't hallucinate.
-"""
+# RECURSE-MOD: clamp REPL output fed back to the root LM
+MAX_OUTPUT_CHARS = int(os.getenv("RLM_MAX_OUTPUT_CHARS", "4000"))
+if len(output) > MAX_OUTPUT_CHARS:
+    output = (
+        output[:MAX_OUTPUT_CHARS]
+        + f"\n...[truncated {len(output) - MAX_OUTPUT_CHARS} chars — slice or filter instead of printing large objects]"
+    )
 ```
 
-### 6.3 Qwen Client (`recurse/engine/qwen.py`)
+Env-var driven so the engine can set it per provider (4000 for Groq, 20000 for OpenAI). The truncation notice doubles as feedback that steers the model away from re-printing.
 
-Wraps the OpenAI-compatible API to talk to Qwen 3.5 models.
+If the library already truncates somewhere, **lower its limit and make it env-configurable** rather than adding a second mechanism. Search the codebase for existing truncation first.
+
+### Mod #2 — directive system prompt for weak models + codebase contexts (Phase 2)
+
+Find the root system prompt (search `vendor/rlm/rlm/` for the prompt template — likely under `core/` or a `prompts` module). Add, behind an env flag or by appending via whatever extension hook exists (`custom_system_prompt` kwarg if present — check the RLM constructor):
+
+- The context may be formatted as `=== FILE: path ===` blocks; grep those markers to navigate.
+- NEVER print more than 2,000 chars of the context at once; slice and filter.
+- Prefer regex search for the literal task keywords before chunking blindly.
+- When confident, emit `FINAL(answer)` immediately — do not keep exploring.
+
+Prefer a constructor kwarg over editing the template if the library supports one; edit the vendored template only if not.
+
+### Future mods (roadmap, NOT v1): 
+
+`llm_query` interception for caching and prompt-injection screening — both live at the same choke point where `llm_query` is defined/dispatched (likely `core/` or the environment module). Locate and note the file path during Phase 2, implement in roadmap phase.
+
+---
+
+## 8. Module Specs
+
+### `recurse/config.py`
 
 ```python
-from openai import AsyncOpenAI
+from dataclasses import dataclass, field
+from pathlib import Path
+import os, yaml
 
-class QwenClient:
-    def __init__(self, model_config: ModelConfig):
-        self.root_model = model_config.root     # e.g. "qwen3.5:35b-a3b"
-        self.sub_model = model_config.sub       # e.g. "qwen3.5:9b"
-        self.client = AsyncOpenAI(
-            base_url=model_config.base_url,     # e.g. "http://localhost:11434/v1"
-            api_key=model_config.api_key or "ollama"  # Ollama doesn't need a real key
-        )
+PRESETS = {
+    "groq": {
+        "backend": "openai",
+        "base_url": "https://api.groq.com/openai/v1",
+        "root_model": "llama-3.3-70b-versatile",
+        "sub_model": "llama-3.1-8b-instant",
+        "api_key_env": "GROQ_API_KEY",
+        "tpm_limit": 12000,            # free tier — engine guardrail uses this
+        "max_output_chars": 4000,
+    },
+    "openai": {
+        "backend": "openai",
+        "base_url": None,
+        "root_model": "gpt-5-mini",
+        "sub_model": "gpt-5-nano",
+        "api_key_env": "OPENAI_API_KEY",
+        "tpm_limit": None,
+        "max_output_chars": 20000,
+    },
+    "anthropic": {
+        "backend": "anthropic",
+        "base_url": None,
+        "root_model": "claude-sonnet-4-6",
+        "sub_model": "claude-haiku-4-5",
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "tpm_limit": None,
+        "max_output_chars": 20000,
+    },
+}
 
-    async def root_completion(self, system_prompt: str, messages: list[dict]) -> str:
-        """Root LLM call. Thinking mode ON. Used for decomposition/orchestration."""
-        response = await self.client.chat.completions.create(
-            model=self.root_model,
-            messages=[{"role": "system", "content": system_prompt}] + messages,
-            max_tokens=16384,
-            temperature=0.6,
-            top_p=0.95,
-        )
-        return response.choices[0].message.content
+@dataclass
+class RecurseConfig:
+    provider: str = "groq"             # current default; switch to "openai" once credits loaded
+    root_model: str | None = None      # override preset
+    sub_model: str | None = None       # override preset; "same" forces single-model mode
+    max_iterations: int = 20
+    environment: str = "local"         # local | docker
+    verbose: bool = True
+    storage_path: Path = Path.home() / ".recurse" / "threads"
+    ingest_exclude: list[str] = field(default_factory=lambda: [
+        "node_modules", ".git", "__pycache__", ".venv", "dist", "build",
+        "*.lock", "*.pyc", ".DS_Store", "vendor",
+    ])
+    max_file_size_kb: int = 500
+    max_total_files: int = 5000
 
-    async def sub_completion(self, query: str, context: str) -> str:
-        """Sub-LLM call. Thinking mode OFF. Used for focused chunk analysis."""
-        messages = [
-            {"role": "system", "content": "/no_think\nYou are a precise analyst. Answer the question based only on the provided context. Be concise."},
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
-        ]
-        response = await self.client.chat.completions.create(
-            model=self.sub_model,
-            messages=messages,
-            max_tokens=4096,
-            temperature=0.3,
-        )
-        return response.choices[0].message.content
+    def resolved(self) -> dict:
+        """Preset merged with overrides + api key from env. Raise a clear error if key missing."""
+        ...
+
+def load_config() -> RecurseConfig:
+    """~/.recurse/config.yaml over defaults; create file with commented defaults if absent."""
+    ...
 ```
 
-### 6.4 Sandbox (`recurse/engine/sandbox.py`)
-
-Executes the root LLM's Python code safely.
-
-Two modes:
-- **Docker** (default, safe): Runs code in a `python:3.12-slim` container. Slower but isolated.
-- **Subprocess** (fast, less safe): Runs code in a subprocess with restricted globals. For trusted contexts only.
-
-```python
-class Sandbox:
-    def __init__(self, mode: str = "subprocess"):
-        self.mode = mode
-        self.globals = {}
-        self.registered_functions = {}
-
-    def set_variable(self, name: str, value):
-        self.globals[name] = value
-
-    def register_function(self, name: str, fn):
-        self.registered_functions[name] = fn
-        self.globals[name] = fn
-
-    async def execute(self, code: str) -> str:
-        """Execute Python code and capture stdout + return value."""
-        if self.mode == "docker":
-            return await self._execute_docker(code)
-        else:
-            return await self._execute_subprocess(code)
-
-    async def _execute_subprocess(self, code: str) -> str:
-        """Execute in a restricted subprocess."""
-        import io, contextlib
-        stdout = io.StringIO()
-        local_vars = {}
-        try:
-            with contextlib.redirect_stdout(stdout):
-                exec(code, self.globals.copy(), local_vars)
-            output = stdout.getvalue()
-            # Also capture any assigned variables for future iterations
-            self.globals.update(local_vars)
-            return output if output else "(no output)"
-        except Exception as e:
-            return f"Error: {type(e).__name__}: {e}"
-```
-
-### 6.5 Context Store (`recurse/store/context_store.py`)
-
-Persistent, structured storage for thread context.
+### `recurse/store.py`
 
 ```python
 class ContextStore:
     """
-    Storage layout:
     ~/.recurse/threads/{thread_id}/
-        manifest.json       — {"files": [{"path": ..., "hash": ..., "size": ...}], "total_tokens": ...}
-        files/
-            src__main.py    — file contents (path separators replaced with __)
-            src__utils.py
-        conversations/
-            {timestamp}.json — {"query": ..., "answer": ..., "tokens": ...}
-        cache/
-            {hash}.json     — cached sub-call results
+        context.txt       # concatenated files + appended conversation turns (what the RLM sees)
+        manifest.json     # ingested file list: path, size, sha256
+        turns/{iso_ts}.json  # structured Q&A records
     """
+    def __init__(self, base_path: Path): ...
 
-    def ingest_directory(self, path: str, thread_id: str,
-                         include: list[str] | None = None,
-                         exclude: list[str] | None = None) -> IngestResult:
-        """Walk directory, store each file, build manifest."""
+    def ingest_directory(self, path: Path, thread_id: str, exclude, max_file_size_kb, max_total_files) -> "IngestResult":
+        # Walk dir; skip excluded/binary/oversized; write context.txt as:
+        #   === FILE: relative/path.py ===
+        #   <contents>
+        # Build manifest.json. Return counts + token estimate (chars//4) + compact file tree string.
+        ...
 
-    def load_context(self, thread_id: str) -> str:
-        """Load all files as a single concatenated string with file path headers."""
-        # Format:
-        # === FILE: src/main.py ===
-        # <contents>
-        # === FILE: src/utils.py ===
-        # <contents>
-
-    def get_file(self, thread_id: str, file_path: str) -> str | None:
-        """Load a single file's contents."""
-
-    def get_manifest(self, thread_id: str) -> dict:
-        """Return file list with metadata."""
-
-    def save_conversation(self, thread_id: str, query: str, answer: str, metadata: dict):
-        """Persist a Q&A pair."""
+    def load_context(self, thread_id: str) -> str: ...
+    def append_turn(self, thread_id: str, query: str, answer: str, meta: dict):
+        # 1) turns/{ts}.json  2) append to context.txt:
+        #    === CONVERSATION TURN {ts} ===
+        #    Q: ...
+        #    A: ...
+        ...
+    def get_turns(self, thread_id: str, limit: int = 10) -> list[dict]: ...
+    def list_threads(self) -> list[dict]: ...
+    def delete_thread(self, thread_id: str): ...
+    def has_thread(self, thread_id: str) -> bool: ...
 ```
 
-### 6.6 Result Cache (`recurse/store/cache.py`)
+Binary detection: try `bytes.decode("utf-8")`; on failure, skip the file and count it in `skipped`.
 
-Avoids redundant sub-LLM calls across queries.
+### `recurse/engine.py`
 
 ```python
-class ResultCache:
-    """
-    Cache key = hash(query + content_hash)
-    Cache value = sub-LLM response
+import os
+from rlm import RLM
+from rlm.logger import RLMLogger
+from recurse.store import ContextStore
 
-    If the same question is asked about the same content, return cached result.
-    """
+class RecurseEngine:
+    def __init__(self, config):
+        self.config = config
+        self.p = config.resolved()                       # provider preset + overrides + api key
+        self.store = ContextStore(config.storage_path)
 
-    def key(self, query: str, context: str) -> str:
-        content_hash = hashlib.sha256(context.encode()).hexdigest()[:16]
-        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
-        return f"{query_hash}_{content_hash}"
+    def _build_rlm(self) -> RLM:
+        os.environ["RLM_MAX_OUTPUT_CHARS"] = str(self.p["max_output_chars"])   # drives vendor Mod #1
+        bk = {"api_key": self.p["api_key"], "model_name": self.p["root_model"]}
+        if self.p["base_url"]:
+            bk["base_url"] = self.p["base_url"]
 
-    def get(self, key: str) -> str | None: ...
-    def set(self, key: str, value: str): ...
-    def clear(self, thread_id: str): ...
+        kwargs = dict(
+            backend=self.p["backend"], backend_kwargs=bk,
+            environment=self.config.environment,
+            max_iterations=self.config.max_iterations,
+            logger=RLMLogger(log_dir=str(self.config.storage_path / "_logs")),
+            verbose=self.config.verbose,
+        )
+        if self.p["sub_model"] not in (None, "same", self.p["root_model"]):
+            sbk = dict(bk, model_name=self.p["sub_model"])
+            kwargs.update(other_backends=[self.p["backend"]], other_backend_kwargs=[sbk])
+        try:
+            return RLM(**kwargs)
+        except TypeError:
+            # other_backends experimental — fall back to single model
+            kwargs.pop("other_backends", None); kwargs.pop("other_backend_kwargs", None)
+            return RLM(**kwargs)
+
+    def _guardrail(self, context: str):
+        est = len(context) // 4
+        tpm = self.p.get("tpm_limit")
+        if tpm and est > 0.6 * tpm:
+            raise RuntimeError(
+                f"Context ≈{est} tokens exceeds safe budget for provider '{self.config.provider}' "
+                f"(TPM limit {tpm}). Shrink the context or switch provider (e.g. provider: openai)."
+            )
+
+    def query(self, query: str, context_source: str, thread_id: str = "default"):
+        context = self._resolve_context(context_source, thread_id)
+        self._guardrail(context)
+        result = self._build_rlm().completion(prompt=context, root_prompt=query)
+        self.store.append_turn(thread_id, query, result.response, {
+            "execution_time": result.execution_time,
+            "usage": str(result.usage_summary),
+            "provider": self.config.provider,
+        })
+        return result
+
+    def ingest(self, path: str, thread_id: str = "default"):
+        return self.store.ingest_directory(
+            Path(path), thread_id,
+            exclude=self.config.ingest_exclude,
+            max_file_size_kb=self.config.max_file_size_kb,
+            max_total_files=self.config.max_total_files,
+        )
+
+    def _resolve_context(self, source: str, thread_id: str) -> str:
+        # "thread:<id>" → load; "path:<dir>" → ingest then load; "inline:<text>" → text;
+        # bare string that is an existing path → ingest+load; else treat as inline.
+        ...
 ```
+
+Everything is **synchronous** — `rlm.completion()` blocks; FastMCP tolerates sync tools. No asyncio in v1.
+
+### `recurse/cli.py`
+
+Commands (argparse, `rich` for output):
+
+```
+recurse "<query>" [--path DIR] [--thread NAME] [--provider groq|openai|anthropic]
+recurse ingest DIR [--thread NAME]
+recurse threads [delete NAME]
+recurse history [--thread NAME] [--limit N]
+recurse init          # write ~/.recurse/config.yaml with commented defaults; print API-key setup steps per provider
+```
+
+`--provider` overrides config for one run (handy while on Groq). Query flow: spinner via `rich.console.Console().status(...)`, print `result.response`, then a dim footer with time + usage. Entry point: `recurse = "recurse.cli:main"` in pyproject.
+
+### `recurse/server.py` (MCP — use FastMCP)
+
+```python
+from mcp.server.fastmcp import FastMCP
+from recurse.config import load_config
+from recurse.engine import RecurseEngine
+
+mcp = FastMCP("recurse")
+engine = RecurseEngine(load_config())
+
+@mcp.tool()
+def recurse_query(query: str, context_source: str, thread_id: str = "default") -> str:
+    """Answer a question over a large codebase/document set using recursive reasoning
+    with persistent per-thread memory. context_source: "path:/abs/dir" | "thread:<id>" | "inline:<text>"."""
+    r = engine.query(query, context_source, thread_id)
+    return f"{r.response}\n\n---\n{r.execution_time:.1f}s | {r.usage_summary}"
+
+@mcp.tool()
+def recurse_ingest(path: str, thread_id: str = "default") -> str:
+    """Index a directory into a persistent thread for future queries."""
+    res = engine.ingest(path, thread_id)
+    return f"Ingested {res.files_count} files (~{res.token_estimate:,} tokens) into '{thread_id}'.\n{res.file_tree}"
+
+@mcp.tool()
+def recurse_threads(action: str = "list", thread_id: str | None = None) -> str:
+    """Manage threads: action = list | history | delete."""
+    ...
+
+if __name__ == "__main__":
+    mcp.run()   # stdio
+```
+
+Register: `claude mcp add recurse --transport stdio -- python -m recurse.server` (run with the project venv's python — use the absolute venv python path in the command if needed).
 
 ---
 
-## 7. File Structure
+## 9. Build Phases (each ends in a runnable verification — do not skip)
 
+### Phase 0 — clean smoke pass (½ hr) — partially done
+The loop already runs; get one **clean needle success** on Groq with a small context and a directive prompt:
+```bash
+export GROQ_API_KEY=gsk_...
+python - <<'EOF'
+from rlm import RLM
+import os
+rlm = RLM(backend='openai',
+    backend_kwargs={'api_key': os.environ['GROQ_API_KEY'],
+                    'base_url': 'https://api.groq.com/openai/v1',
+                    'model_name': 'llama-3.3-70b-versatile'},
+    environment='local', verbose=True)
+ctx = ('apple banana cherry ' * 600) + '\nThe secret code is PURPLE-ELEPHANT-42.\n' + ('mango grape kiwi ' * 600)
+r = rlm.completion(prompt=ctx, root_prompt='Find the secret code (format WORD-WORD-NUMBER). Grep the context for the word "secret". Emit FINAL(code) as soon as you find it.')
+print('ANSWER:', r.response)
+EOF
 ```
-recurse/
-├── DESIGN.md                    # this file
-├── README.md
-├── LICENSE                      # MIT
-├── pyproject.toml
-├── recurse/
-│   ├── __init__.py
-│   ├── server.py                # MCP server entry point
-│   ├── config.py                # config loading from ~/.recurse/config.yaml
-│   ├── engine/
-│   │   ├── __init__.py
-│   │   ├── core.py              # RecurseEngine — the RLM loop
-│   │   ├── qwen.py              # QwenClient — Qwen 3.5 API wrapper
-│   │   ├── sandbox.py           # Sandbox — safe Python execution
-│   │   └── prompts.py           # system prompts for root and sub LLMs
-│   ├── store/
-│   │   ├── __init__.py
-│   │   ├── context_store.py     # structured file/thread storage
-│   │   └── cache.py             # sub-call result caching
-│   └── tools/
-│       ├── __init__.py
-│       ├── query.py             # recurse_query implementation
-│       ├── ingest.py            # recurse_ingest implementation
-│       ├── status.py            # recurse_status implementation
-│       └── threads.py           # recurse_threads implementation
-├── tests/
-│   ├── test_engine.py
-│   ├── test_sandbox.py
-│   ├── test_store.py
-│   ├── test_mcp_tools.py
-│   └── fixtures/
-│       ├── sample_codebase/     # small test codebase
-│       └── sample_context.txt   # long text for NIAH testing
-└── examples/
-    ├── setup_claude_code.md     # step-by-step install guide
-    └── config.example.yaml
+**Accept:** response contains `PURPLE-ELEPHANT-42`. (If the model still flails, that's signal for Mod #2's prompt work, not a blocker — proceed.)
+
+### Phase 1 — config + engine
+Build `config.py` + `engine.py` (specs above), including guardrail + preset system + `other_backends` fallback.
+**Accept:** a 5-line script: `RecurseEngine(load_config()).query("find the secret code…", "inline:" + ctx)` returns the needle. Guardrail check: feed a 200K-char context on provider=groq → clean RuntimeError with the helpful message, **no API call made**.
+
+### Phase 2 — vendor mods
+Implement Mod #1 (truncation, env-driven) and Mod #2 (directive prompt). Add `vendor/rlm/RECURSE-MODS.md` listing each mod: file, line area, rationale, env vars.
+**Accept:** rerun a needle test where the root LM is induced to print a big chunk (e.g., 60K-char context on OpenAI later, or assert by unit-testing the truncation function directly); confirm output in the conversation history is clamped to the configured limit. Grep `vendor/rlm` for `RECURSE-MOD` returns both sites.
+
+### Phase 3 — store + ingest
+Build `store.py`.
+**Accept:**
+```python
+store.ingest_directory(Path("./recurse"), "self", ...)        # ingest our own package
+ctx = store.load_context("self")
+assert "=== FILE: " in ctx and "engine.py" in ctx
 ```
+Then end-to-end: `engine.query("what does engine.py do?", "thread:self")` on Groq (our package is small enough) returns a grounded answer.
+
+### Phase 4 — CLI
+Build `cli.py` + pyproject entry point (`pip install -e .` for the recurse package itself).
+**Accept:** fresh terminal → `recurse init`, then `recurse "what does this project do?" --path ./recurse --thread self` prints an answer; `recurse threads` lists `self`; `recurse history --thread self` shows the turn.
+
+### Phase 5 — persistent memory (the Monolith feature)
+`append_turn` already wires it; verify the loop closes.
+**Accept:** ask Q1, then a follow-up Q2 that depends on Q1's answer in the same thread; A2 reflects A1. `~/.recurse/threads/self/turns/` has two files; `context.txt` ends with two `=== CONVERSATION TURN` blocks.
+
+### Phase 6 — MCP server
+Build `server.py`; register with Claude Code.
+**Accept:** in Claude Code: "use recurse to ingest <dir> and then ask it how X works" → it calls `recurse_ingest` then `recurse_query` and relays the answer. This is Monolith's user-facing behavior, achieved locally.
+
+### Phase 7 — polish & ship v0.1
+README (setup per provider incl. "ChatGPT Pro ≠ API credits" note), error handling (missing API key → name the env var; empty dir; Ollama-style helpful messages), `.gitignore` (`.venv/`, `__pycache__/`, `logs/`, `*.jsonl`), demo GIF, tag v0.1.0.
 
 ---
 
-## 8. Configuration
+## 10. Configuration File
+
+`~/.recurse/config.yaml` (created by `recurse init`):
 
 ```yaml
-# ~/.recurse/config.yaml
+provider: groq              # groq (free, small contexts) | openai (recommended) | anthropic
+# root_model: gpt-5-mini    # optional per-model overrides
+# sub_model: same           # "same" forces single-model mode if other_backends misbehaves
 
-models:
-  root: qwen3.5:35b-a3b
-  sub: qwen3.5:9b
-  base_url: http://localhost:11434/v1   # Ollama default
-  api_key: ollama                        # Ollama doesn't validate keys
+max_iterations: 20
+environment: local          # local | docker
+verbose: true
 
-  # Alternative: Qwen API (DashScope)
-  # root: qwen3.5-plus
-  # sub: qwen3.5-flash
-  # base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  # api_key: ${DASHSCOPE_API_KEY}
-
-  # Alternative: OpenRouter
-  # root: qwen/qwen3.5-35b-a3b
-  # sub: qwen/qwen3.5-9b
-  # base_url: https://openrouter.ai/api/v1
-  # api_key: ${OPENROUTER_API_KEY}
-
-engine:
-  max_iterations: 15
-  max_output_truncation: 50000       # chars — truncate sandbox output beyond this
-  thinking_mode_root: true           # enable <think> for root LLM
-  thinking_mode_sub: false           # disable <think> for sub-LLM
-
-sandbox:
-  mode: subprocess                   # subprocess | docker
-  timeout_seconds: 30                # per code execution
-
-storage:
-  path: ~/.recurse/threads
-  max_cache_size_mb: 500
+storage_path: ~/.recurse/threads
 
 ingest:
-  default_exclude:
-    - node_modules
-    - .git
-    - __pycache__
-    - .venv
-    - "*.pyc"
-    - "*.lock"
-    - dist
-    - build
-  max_file_size_kb: 500              # skip files larger than this
+  exclude: [node_modules, .git, __pycache__, .venv, dist, build, vendor, "*.lock", "*.pyc"]
+  max_file_size_kb: 500
   max_total_files: 5000
 ```
 
----
-
-## 9. Implementation Order
-
-Build in this exact order. Each phase is independently testable.
-
-### Phase 1: Qwen Client + Basic RLM Loop
-
-**Files:** `recurse/engine/qwen.py`, `recurse/engine/sandbox.py`, `recurse/engine/prompts.py`, `recurse/engine/core.py`, `recurse/config.py`
-
-**Goal:** A Python script that runs an RLM query against a local Qwen 3.5 model.
-
-**Test:**
-```python
-engine = RecurseEngine(config)
-result = await engine.query(
-    query="What is the secret number?",
-    context="... 500K chars of random text with 'The secret number is 42' hidden inside ...",
-    thread_id="test"
-)
-assert "42" in result.answer
-```
-
-**Depends on:** User has Ollama running with `qwen3.5:35b-a3b` and `qwen3.5:9b` pulled.
-
-### Phase 2: Context Store
-
-**Files:** `recurse/store/context_store.py`, `recurse/store/cache.py`
-
-**Goal:** Ingest a directory into structured storage. Load it back as concatenated context.
-
-**Test:**
-```python
-store = ContextStore("~/.recurse/threads")
-result = store.ingest_directory("./my-project", thread_id="proj1")
-context = store.load_context("proj1")
-assert "=== FILE:" in context
-```
-
-### Phase 3: MCP Server + Tools
-
-**Files:** `recurse/server.py`, `recurse/tools/query.py`, `recurse/tools/ingest.py`, `recurse/tools/status.py`, `recurse/tools/threads.py`
-
-**Goal:** A working MCP server that Claude Code can connect to.
-
-**Test:**
-```bash
-# Add to Claude Code
-claude mcp add recurse --transport stdio -- python -m recurse.server
-
-# In Claude Code, the tools are now available
-# Claude Code can call recurse_ingest to index a project
-# Then call recurse_query to ask questions about it
-```
-
-### Phase 4: Caching + Performance
-
-**Goal:** Sub-call caching, async batch queries, progress reporting.
-
-**Test:** Run the same query twice. Second run should be significantly faster with cache hits reported.
-
-### Phase 5: Polish
-
-**Goal:** README, error handling, edge cases, example configs, Claude Code setup guide.
+API keys come from env vars only (`GROQ_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) — never stored in the file.
 
 ---
 
-## 10. Dependencies
+## 11. Repo Hygiene & Packaging
 
-```toml
-[project]
-name = "recurse-rlm"
-version = "0.1.0"
-requires-python = ">=3.11"
-license = "MIT"
-
-dependencies = [
-    "openai>=2.14.0",          # async client for Qwen (OpenAI-compatible API)
-    "mcp>=1.0.0",              # MCP server SDK
-    "pydantic>=2.0.0",         # config validation
-    "pyyaml>=6.0",             # config file parsing
-    "rich>=13.0.0",            # terminal output (logging, progress)
-]
-
-[project.optional-dependencies]
-docker = ["docker>=7.0.0"]     # for Docker sandbox mode
-```
+- **Vendor git:** `vendor/rlm` was cloned from upstream and has its own `.git`. Pick ONE: **(recommended)** `rm -rf vendor/rlm/.git`, commit the code directly into this repo, and create `vendor/rlm/VENDORED.md` recording upstream URL + the commit hash vendored from (for manual future syncs). Alternative: make it a proper git submodule of a GitHub fork — only if the user wants easy upstream merges; skip otherwise.
+- **License:** upstream is MIT — keep `vendor/rlm/LICENSE` intact; Recurse itself is MIT.
+- **pyproject (recurse):** do **NOT** list `rlms` as a dependency — a fresh `pip install` would pull the unmodified PyPI package and shadow the fork. Document the two-step dev install in README instead:
+  ```bash
+  pip install -e vendor/rlm && pip install -e .
+  ```
+  Deps for recurse itself: `mcp>=1.0.0`, `pyyaml>=6.0`, `rich>=13.0.0`. Entry point: `recurse = "recurse.cli:main"`. `requires-python = ">=3.12"`.
+- **CLAUDE.md:** ensure it contains: "Read DESIGN.md in full before any task. The RLM library is vendored at vendor/rlm (editable-installed, modifiable — mods are tagged RECURSE-MOD)."
+- **.gitignore:** `.venv/`, `recurse/.venv/`, `__pycache__/`, `logs/`, `*.jsonl`, `.DS_Store`.
 
 ---
 
-## 11. Key Decisions Log
+## 12. Gotchas (Claude Code: read twice)
 
-| Decision | Choice | Reasoning |
-|----------|--------|-----------|
-| Model framework | Qwen 3.5 via Ollama | OpenAI-compatible API, runs locally, Apache 2.0, trivial setup |
-| Root model | 35B-A3B | Only 3B active params — fast + cheap. Strong at code gen (RLM needs this) |
-| Sub model | 9B | Beats 30B-class models. Fast enough for many sub-calls per query |
-| MCP transport | stdio | Simplest for Claude Code local integration. HTTP can be added later |
-| Sandbox default | subprocess | Faster than Docker for dev. Docker available as config option |
-| Context format | Concatenated with file headers | Simple, the RLM can parse headers with regex. No complex indexing needed initially |
-| Cache strategy | Content-hash + query-hash | Deterministic. Same question + same content = same answer |
-| License | MIT | Maximum adoption. Matches alexzhang13/rlm |
-| Async | Yes (asyncio) | MCP server is async. Qwen client uses AsyncOpenAI. Enables future batch parallelism |
+1. **Activate the right venv:** it lives at `recurse/.venv` *inside the inner package folder* (path: `<repo>/recurse/.venv`). Use its python explicitly when in doubt.
+2. **Never `pip install rlms` from PyPI** — it shadows the fork. If the import path ever stops pointing at `vendor/rlm`, run `pip uninstall rlms -y && pip install -e vendor/rlm` and re-verify with `python -c "import rlm; print(rlm.__file__)"`.
+3. **Groq 413 ≠ bug:** `rate_limit_exceeded` on tokens means the request (context + accumulated history + output echo) exceeded 12K tokens. The guardrail + truncation mod exist precisely for this. Keep Groq test contexts ≤ ~30K chars.
+4. **Insufficient_quota on OpenAI ≠ rate limit:** it means $0 credit balance. ChatGPT Pro does not grant API credits.
+5. **Weak models flail:** on Groq, make `root_prompt`s directive (tell it to grep for specific keywords, tell it to emit FINAL immediately). Don't tune the architecture around llama's confusion — `gpt-5-mini` resolves it.
+6. **`other_backends` is experimental:** always keep the single-model fallback path working.
+7. **`exec()` runs LM-generated code in-process** (`environment="local"`). Fine for trusted personal use; `environment="docker"` is the one-line upgrade for untrusted contexts. Never run `local` against contexts you don't trust.
+8. **Costs:** one RLM query = many LM calls (root per iteration + sub per chunk). Keep `max_iterations` modest (20) and watch `usage_summary`.
 
 ---
 
-## 12. Improvements Over Monolith
+## 13. Roadmap (after v0.1 — all additive, none require rearchitecting)
 
-| Monolith | Recurse |
-|----------|---------|
-| GPT-5 + GPT-5-nano (OpenAI only) | Qwen 3.5 local (any OpenAI-compatible endpoint) |
-| Requires Modal + Cloudflare | Runs entirely on localhost |
-| Flat `context.txt` per thread | Structured per-file storage with manifest |
-| No caching | Content-hash sub-call cache |
-| Blocking sequential sub-calls | Async + `batch_llm_query()` ready |
-| No progress feedback | `recurse_status` tool for long queries |
-| `exec()` in host process | Subprocess isolation (Docker optional) |
-| GPL-3.0 | MIT |
-| No thinking mode management | Root thinks, sub doesn't (configurable) |
-| No ingest/indexing tool | `recurse_ingest` pre-processes codebases |
+1. **Sub-call cache** — intercept at the `llm_query` choke point in the vendored source; key `sha256(query + chunk)`; store under thread `cache/`. Highest value-per-effort: repeated queries on stable codebases get drastically cheaper.
+2. **Prompt-injection screener** — same choke point: screen each decomposed chunk for injected instructions before it reaches the sub-LM. Small decomposed pieces = cleaner detection surface than one monolithic prompt. Novel research angle and standalone-product potential.
+3. **Modal Sandbox environment** — the user's explicit learning milestone: swap the local `exec()` REPL for `modal.Sandbox` isolation (`environment="modal"` exists upstream; study it, then extend). Teaches real serverless isolation; mirrors Monolith's `ModalSandboxSubRLM`.
+4. **Batch sub-calls** — push the prompt to use `batch_llm_query` for independent chunks (parallelism).
+5. **Recursion depth > 1** — upstream caps at 1; the paper notes deeper recursion unlocks harder tasks.
+6. **One-shot multi-file edits** — extend from answering questions to proposing/applying consistent changes across a codebase (the user's "sprint team / one-shot platform" idea).
+7. **Cloud + desktop** — optional Modal-hosted backend (the monetization seam: free local, paid cloud) and a drag-a-folder desktop app. Last, not first.
 
 ---
 
-## 13. Future Extensions (Not in v1)
+## 14. Key Decisions
 
-- **Docker sandbox by default** — once the subprocess path is stable
-- **Modal/cloud compute** — for users without GPU hardware
-- **Multimodal context** — Qwen 3.5 handles images/video natively; could analyze screenshots, diagrams
-- **Fine-tuned decomposition** — train a LoRA on Qwen 3.5 specifically for RLM-style REPL code generation
-- **Prompt injection detection** — inspect each sub-call for adversarial content before execution
-- **MCP resources** — expose thread trajectories as `recurse://threads/{id}/trajectory`
-- **Session auto-upload** — Claude Code Stop hook to auto-capture transcripts (like Monolith)
-- **Streaming partial answers** — send intermediate findings back to Claude Code as they're discovered
+| Decision | Choice | Why |
+|---|---|---|
+| Vendored fork vs pip dependency | Fork in `vendor/rlm`, editable-installed | User explicitly wants to learn/modify internals; mods (truncation, prompts, later cache/screener/depth) need source access. Verified working on this machine. |
+| Provider model | Config presets: Groq free now → OpenAI `gpt-5-mini` for real work | No API credits yet; Groq proves the pipeline free; gpt-5-mini is the paper's benchmarked, protocol-reliable config. Swap = one yaml line. |
+| Truncation as vendor Mod #1 | Hard clamp, env-configurable | Directly caused the observed 413 failure; also protects cost on any provider. |
+| Guardrail pre-check | Estimate tokens vs preset TPM | Converts cryptic provider errors into actionable messages before spending a call. |
+| Sync everywhere | No asyncio in v1 | `rlm.completion()` is blocking; FastMCP accepts sync tools; simplicity wins. |
+| Local-disk persistence | `~/.recurse/threads/` | Recreates Monolith's cross-session memory without Modal Volumes. |
+| CLI first, MCP second | Shared engine | CLI testable in isolation; MCP rides Claude Code. Mirrors the phase order. |
+| `environment="local"` default | docker as config option | Personal trusted use; flagged in Gotchas #7. |
+| MIT license | matches upstream | Maximum adoption; upstream LICENSE preserved in vendor/. |
