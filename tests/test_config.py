@@ -57,5 +57,13 @@ def test_resolved_missing_key_names_env_var(monkeypatch):
 
 
 def test_resolved_unknown_provider():
-    with pytest.raises(ValueError, match="ollama"):
-        RecurseConfig(provider="ollama").resolved()
+    with pytest.raises(ValueError, match="nonexistent"):
+        RecurseConfig(provider="nonexistent").resolved()
+
+
+def test_resolved_local_provider_needs_no_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    p = RecurseConfig(provider="ollama").resolved()
+    assert p["api_key"] == "local"
+    assert p["base_url"] == "http://localhost:11434/v1"
+    assert p["tpm_limit"] is None

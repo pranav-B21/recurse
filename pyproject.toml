@@ -22,6 +22,11 @@ recurse = "recurse.cli:main"
 packages = ["recurse"]
 exclude = ["recurse/.venv"]
 
+[tool.pytest.ini_options]
+# Only collect Recurse's own tests — the vendored fork ships its own `tests/`
+# package whose module names collide on a bare `pytest` invocation.
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

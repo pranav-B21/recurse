@@ -41,6 +41,20 @@ PRESETS: dict[str, dict] = {
         "tpm_limit": None,
         "max_output_chars": 20000,
     },
+    "ollama": {
+        # Local, free, no API key — Ollama exposes an OpenAI-compatible server
+        # at localhost:11434/v1. Pull the model first, e.g. `ollama pull qwen3.5:35b-a3b`
+        # (a fast MoE — only ~3B active params — that handles the RLM root protocol
+        # well). Smaller local models flail more; the Mod #2 directive prompt helps.
+        # Override root_model in ~/.recurse/config.yaml for whatever you have pulled.
+        "backend": "openai",
+        "base_url": "http://localhost:11434/v1",
+        "root_model": "qwen3.5:35b-a3b",
+        "sub_model": "same",  # single model — avoids the experimental other_backends path
+        "api_key_env": None,  # local server ignores the key
+        "tpm_limit": None,
+        "max_output_chars": 8000,
+    },
 }
 
 DEFAULT_CONFIG_PATH = Path.home() / ".recurse" / "config.yaml"
@@ -49,7 +63,7 @@ CONFIG_TEMPLATE = """\
 # Recurse configuration. API keys are read from env vars only
 # (GROQ_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY) — never stored here.
 
-provider: groq              # groq (free, small contexts) | openai (recommended) | anthropic
+provider: groq              # groq (free, small) | openai (recommended) | anthropic | ollama (local, free)
 # root_model: gpt-5-mini    # optional per-model overrides
 # sub_model: same           # "same" forces single-model mode if other_backends misbehaves
 
@@ -101,14 +115,20 @@ class RecurseConfig:
         if self.sub_model:
             p["sub_model"] = self.sub_model
 
-        api_key = os.environ.get(p["api_key_env"])
-        if not api_key:
-            raise RuntimeError(
-                f"Missing API key for provider '{self.provider}': "
-                f"set the {p['api_key_env']} environment variable. "
-                f"(export {p['api_key_env']}=...)"
-            )
-        p["api_key"] = api_key
+        key_env = p["api_key_env"]
+        if key_env:
+            api_key = os.environ.get(key_env)
+            if not api_key:
+                raise RuntimeError(
+                    f"Missing API key for provider '{self.provider}': "
+                    f"set the {key_env} environment variable. "
+                    f"(export {key_env}=...)"
+                )
+            p["api_key"] = api_key
+        else:
+            # Local OpenAI-compatible server (e.g. Ollama) ignores the key but
+            # the client still requires a non-empty string.
+            p["api_key"] = "local"
         return p
 
 

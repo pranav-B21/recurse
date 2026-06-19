@@ -51,6 +51,50 @@ API keys come from env vars only — never stored in the config file.
 Switch providers in `~/.recurse/config.yaml` (`provider: openai`) or per run
 with `--provider`.
 
+## Verify it works
+
+After installing, confirm the fork is wired up and the suite is green:
+
+```bash
+source recurse/.venv/bin/activate
+
+# 1. The vendored fork — NOT the PyPI package — must be on the import path:
+python -c "import rlm; print(rlm.__file__)"
+#   → .../recurse/vendor/rlm/rlm/__init__.py
+
+# 2. Run the test suite (no API key needed — network is mocked):
+pytest                       # 35 passing
+```
+
+The suite (`tests/`) covers config presets + guardrails, the store/ingest
+round-trip, the engine's context resolution, the MCP tool wiring, and the
+vendor truncation mod — all without hitting a provider.
+
+To prove the live loop end-to-end you need an API key. The cheapest check is a
+needle test on Groq's free tier:
+
+```bash
+export GROQ_API_KEY=gsk_...
+recurse init
+mkdir -p /tmp/needle && printf 'the secret code is PURPLE-ELEPHANT-42\n' > /tmp/needle/note.txt
+recurse "what is the secret code?" --path /tmp/needle --thread demo
+```
+
+A grounded answer containing `PURPLE-ELEPHANT-42` means the full pipeline
+(ingest → RLM loop → persisted turn) works.
+
+### Examples
+
+`examples/ab_demo.py` is a live A/B that shows the two vendor mods actually
+change behavior: Part 1 is a zero-token proof that Mod #1 clamps a 40K-char REPL
+print; Parts 2–3 run the same Groq model with the mods on vs. off and report
+needle accuracy, iterations, tokens, and the largest message fed back into the
+root model (the quantity that blew Groq's per-request cap before the fix).
+
+```bash
+recurse/.venv/bin/python examples/ab_demo.py   # needs GROQ_API_KEY (read from .env)
+```
+
 ## CLI
 
 ```bash
